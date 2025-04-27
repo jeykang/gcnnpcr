@@ -16,7 +16,7 @@ from isaacsim.examples.extension.core_connectors import LoadButton, ResetButton
 from isaacsim.gui.components.element_wrappers import CollapsableFrame, StateButton
 from isaacsim.gui.components.ui_utils import get_style
 from omni.usd import StageEventType
-from pxr import Sdf, UsdLux, Gf, UsdGeom, Vt # Import UsdGeom and Vt
+from pxr import Sdf, UsdLux, Gf, UsdGeom, Vt, UsdShade # Import UsdShade for materials
 import logging
 import matplotlib
 import matplotlib.pyplot as plt
@@ -32,6 +32,7 @@ import math
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
 from scipy.spatial import ConvexHull # Import ConvexHull
+from scipy.spatial.distance import cdist # For distance calculation
 
 # Configure logger
 logger = logging.getLogger(__name__)
@@ -97,7 +98,7 @@ class LidarCompletionScenario:
         self._model_path = None
         self._output_dir = None
         self._inference_callback = None  # We'll store a function pointer here
-        self._show_reconstruction = True # Controls visibility of the output visualization
+        self._show_completed_mesh = True # Controls visibility of the output mesh overlay
 
     def set_inference_callback(self, callback_fn):
         """
@@ -197,12 +198,9 @@ class LidarCompletionScenario:
         self._apply_model = enable
 
     def _remove_previous_visualization(self):
-        """Removes previously generated point cloud or mesh visualizations"""
+        """Removes previously generated mesh visualization"""
         stage = get_current_stage()
-        point_cloud_path = "/World/ReconstructedPointCloud"
         mesh_path = "/World/ReconstructedMesh"
-        if stage.GetPrimAtPath(point_cloud_path).IsValid():
-            omni.kit.commands.execute("DeletePrims", paths=[point_cloud_path], destructive=True)
         if stage.GetPrimAtPath(mesh_path).IsValid():
             omni.kit.commands.execute("DeletePrims", paths=[mesh_path], destructive=True)
 
@@ -260,34 +258,24 @@ class LidarCompletionScenario:
         else:
             logger.info("[LidarCompletionScenario] Could not create RtxSensorCpuIsaacCreateRTXLidarScanBuffer annotator.")
 
-    def _create_point_cloud_visualization(self, points_np):
-        """Creates a UsdGeom.Points prim from the numpy array."""
-        stage = get_current_stage()
-        point_cloud_path = "/World/ReconstructedPointCloud"
-        points_prim = UsdGeom.Points.Define(stage, point_cloud_path)
-        points_prim.CreatePointsAttr().Set(Vt.Vec3fArray.FromNumpy(points_np.astype(np.float32)))
-        points_prim.CreateWidthsAttr().Set([1.0] * len(points_np)) # Optional: control point size
-        # Set color (e.g., green)
-        points_prim.CreateDisplayColorAttr().Set([Gf.Vec3f(0, 1, 0)])
-        logger.info(f"[LidarCompletionScenario] Created point cloud visualization at {point_cloud_path}")
-
     def _create_mesh_visualization(self, points_np):
-        """Creates a UsdGeom.Mesh prim using Convex Hull."""
+        """Creates a UsdGeom.Mesh prim using Convex Hull and colors vertices based on nearest scene mesh."""
         if len(points_np) < 4: # Need at least 4 points for 3D convex hull
             logger.info("[LidarCompletionScenario] Not enough points for mesh visualization.")
             return
         try:
+            # --- Convex Hull remains the same ---
             hull = ConvexHull(points_np)
-            vertices = points_np[hull.vertices]
-            # The faces from ConvexHull are indices into the hull.vertices array, not the original points_np
-            faces = hull.simplices # Each row is indices of vertices forming a face (triangle)
+            # Use all points from the convex hull as vertices for color calculation
+            vertices_world = points_np[hull.vertices]
+            faces = hull.simplices # Indices into vertices_world
 
             stage = get_current_stage()
             mesh_path = "/World/ReconstructedMesh"
             mesh_prim = UsdGeom.Mesh.Define(stage, mesh_path)
 
-            # Set mesh properties
-            points_vt = Vt.Vec3fArray.FromNumpy(vertices.astype(np.float32))
+            # --- Set basic mesh properties ---
+            points_vt = Vt.Vec3fArray.FromNumpy(vertices_world.astype(np.float32))
             mesh_prim.CreatePointsAttr().Set(points_vt)
 
             face_vertex_counts = Vt.IntArray([3] * len(faces)) # All triangles
@@ -296,30 +284,79 @@ class LidarCompletionScenario:
             face_vertex_indices = Vt.IntArray(faces.flatten().astype(np.int32))
             mesh_prim.CreateFaceVertexIndicesAttr().Set(face_vertex_indices)
 
-            # Set color (e.g., green-blue) and transparency
-            mesh_prim.CreateDisplayColorAttr().Set([Gf.Vec3f(0, 0.7, 0.3)])
-            # Make it slightly transparent to allow seeing the original scene through it
-            # Note: Requires a material with transparency enabled, or use UsdPreviewSurface
-            # For simplicity, we just set color here. Transparency might need material setup.
+            # --- Vertex Color Calculation ---
+            target_prims = []
+            target_centers_world = []
+            target_colors = []
+            default_color = Gf.Vec3f(0.5, 0.5, 0.5) # Default gray if no color found
+
+            # Iterate through all prims to find potential target meshes
+            for prim in stage.Traverse():
+                if prim.GetPath() == mesh_path: # Skip self
+                    continue
+                if prim.IsA(UsdGeom.Mesh):
+                    try:
+                        # Get world bounding box
+                        bbox_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), includedPurposes=[UsdGeom.Tokens.default_])
+                        prim_bbox = bbox_cache.ComputeWorldBound(prim).GetBox()
+                        center_world = prim_bbox.GetMidpoint()
+
+                        # Get displayColor (or default)
+                        color_attr = prim.GetDisplayColorAttr()
+                        color = color_attr.Get()[0] if color_attr and color_attr.HasValue() and color_attr.Get() else default_color
+                        # TODO: Could also try getting material color if displayColor is not set
+
+                        target_prims.append(prim)
+                        target_centers_world.append(np.array(center_world))
+                        target_colors.append(color)
+                    except Exception as e:
+                        logger.warning(f"Could not process target prim {prim.GetPath()}: {e}")
+
+            vertex_colors_list = []
+            if target_centers_world:
+                target_centers_np = np.array(target_centers_world) # Shape [M, 3]
+                # Calculate distances between all vertices and all target centers
+                # vertices_world shape: [N, 3], target_centers_np shape: [M, 3]
+                dist_matrix = cdist(vertices_world, target_centers_np) # Shape [N, M]
+                # Find the index of the closest target center for each vertex
+                nearest_indices = np.argmin(dist_matrix, axis=1) # Shape [N]
+
+                # Assign colors based on the nearest prim
+                for idx in nearest_indices:
+                    vertex_colors_list.append(target_colors[idx])
+            else:
+                # If no target meshes found, assign default color to all vertices
+                logger.info("[LidarCompletionScenario] No target meshes found for color coding. Using default color.")
+                vertex_colors_list = [default_color] * len(vertices_world)
+
+            # --- Apply Vertex Colors ---
+            if vertex_colors_list:
+                vertex_colors_vt = Vt.Vec3fArray(vertex_colors_list)
+                # Create or get the primvar for displayColor
+                color_primvar = mesh_prim.CreatePrimvar("primvars:displayColor", Sdf.ValueTypeNames.Color3fArray, UsdGeom.Tokens.vertex)
+                color_primvar.Set(vertex_colors_vt)
+                # color_primvar.SetInterpolation(UsdGeom.Tokens.vertex) # Set interpolation explicitly if needed, often inferred
+
+            # Remove the single mesh color attribute if it exists or was previously set
+            # mesh_prim.RemoveProperty("primvars:displayColor") # If previously set with different interpolation
+            if mesh_prim.GetAttribute("displayColor").IsValid():
+                 mesh_prim.GetAttribute("displayColor").Clear() # Clear single color if set
+
+            # Optional: Make it slightly transparent (requires material setup usually)
             # primvarsApi = UsdGeom.PrimvarsAPI(mesh_prim)
-            # primvarsApi.CreatePrimvar("displayOpacity", Sdf.ValueTypeNames.Float).Set(0.5)
+            # primvarsApi.CreatePrimvar("displayOpacity", Sdf.ValueTypeNames.FloatArray, UsdGeom.Tokens.vertex).Set([0.8] * len(vertices_world))
 
-            logger.info(f"[LidarCompletionScenario] Created mesh visualization at {mesh_path}")
+
+            logger.info(f"[LidarCompletionScenario] Created mesh visualization at {mesh_path} with vertex colors.")
         except Exception as e:
-            logger.error(f"[LidarCompletionScenario] Error creating mesh: {e}", exc_info=True)
+            # Convex hull can fail if points are degenerate (e.g., co-planar)
+            logger.error(f"[LidarCompletionScenario] Error creating mesh visualization: {e}", exc_info=True)
 
-    def _toggle_reconstruction_visibility(self, show):
-        """Toggle the visibility of the reconstructed point cloud and mesh"""
-        self._show_reconstruction = show
+    def _toggle_completed_mesh_visibility(self, show):
+        """Toggle the visibility of the reconstructed mesh overlay"""
+        self._show_completed_mesh = show
         stage = get_current_stage()
-        point_cloud_path = "/World/ReconstructedPointCloud"
         mesh_path = "/World/ReconstructedMesh"
-
-        # Toggle point cloud visibility
-        pc_prim = stage.GetPrimAtPath(point_cloud_path)
-        if pc_prim.IsValid():
-            imageable = UsdGeom.Imageable(pc_prim)
-            imageable.GetVisibilityAttr().Set(UsdGeom.Tokens.inherited if show else UsdGeom.Tokens.invisible)
 
         # Toggle mesh visibility
         mesh_prim = stage.GetPrimAtPath(mesh_path)
@@ -428,7 +465,7 @@ class LidarCompletionScenario:
 
     def _visualize_output_in_scene(self, model_output, center, scale):
         """
-        De-normalizes the model output and adds it to the scene as points and/or mesh.
+        De-normalizes the model output and adds it to the scene as a mesh overlay.
         Args:
             model_output: The raw output tensor from the model. [B, C, N] or [B, N, C]
             center: Original center used for normalization
@@ -462,12 +499,11 @@ class LidarCompletionScenario:
         # 2. Remove previous visualizations
         self._remove_previous_visualization()
 
-        # 3. Create new visualizations if enabled
-        if self._show_reconstruction:
-            self._create_point_cloud_visualization(points_np)
-            # self._create_mesh_visualization(points_np) # Optionally create mesh
+        # 3. Create new mesh visualization if enabled
+        if self._show_completed_mesh:
+            self._create_mesh_visualization(points_np)
 
-        logger.info(f"[LidarCompletionScenario] Visualized output with {points_np.shape[0]} points.")
+        logger.info(f"[LidarCompletionScenario] Visualized output mesh with {points_np.shape[0]} points.")
 
 ###############################################################################
 # EXTENSION UI - SAME TEMPLATE, ADDED ANNOTATOR LOGIC
@@ -557,12 +593,12 @@ class UIBuilder:
 
                 # Add a toggle for visualization
                 with ui.HStack(spacing=5):
-                    ui.Label("Show Reconstruction:", width=130)
-                    self._show_reconstruction_checkbox = ui.CheckBox(
-                        model=ui.SimpleBoolModel(self._scenario._show_reconstruction) # Use scenario's state
+                    ui.Label("Show Completed Mesh:", width=130) # Updated Label
+                    self._show_completed_mesh_checkbox = ui.CheckBox( # Renamed variable
+                        model=ui.SimpleBoolModel(self._scenario._show_completed_mesh) # Use scenario's state
                     )
                     # Link checkbox changes to the scenario's visibility toggle method
-                    self._show_reconstruction_checkbox.model.add_value_changed_fn(self._on_show_reconstruction_changed)
+                    self._show_completed_mesh_checkbox.model.add_value_changed_fn(self._on_show_completed_mesh_changed) # Renamed callback
 
         run_scenario_frame = CollapsableFrame("Run Scenario")
         with run_scenario_frame:
@@ -700,8 +736,8 @@ class UIBuilder:
                  self._scenario_state_btn.set_state_b() # Set to STOP state
                  self._scenario_state_btn.enabled = True
 
-    def _on_show_reconstruction_changed(self, model):
-        self._scenario._toggle_reconstruction_visibility(model.get_value_as_bool())
+    def _on_show_completed_mesh_changed(self, model):
+        self._scenario._toggle_completed_mesh_visibility(model.get_value_as_bool())
 
     def _on_inference_complete(self, pt_path):
         """
@@ -809,3 +845,4 @@ class UIBuilder:
                     os.remove(temp_path)
                 except OSError as e:
                     logger.error(f"Error removing temporary file {temp_path}: {e}")
+
