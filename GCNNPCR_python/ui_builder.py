@@ -10,13 +10,13 @@
 import omni.timeline
 import omni.ui as ui
 from isaacsim.core.api.world import World
-from isaacsim.core.prims import SingleXFormPrim
+from isaacsim.core.prims import XFormPrim # Use XFormPrim for general transformations
 from isaacsim.core.utils.stage import create_new_stage, get_current_stage
 from isaacsim.examples.extension.core_connectors import LoadButton, ResetButton
 from isaacsim.gui.components.element_wrappers import CollapsableFrame, StateButton
 from isaacsim.gui.components.ui_utils import get_style
 from omni.usd import StageEventType
-from pxr import Sdf, UsdLux, Gf
+from pxr import Sdf, UsdLux, Gf, UsdGeom, Vt # Import UsdGeom and Vt
 import logging
 import matplotlib
 import matplotlib.pyplot as plt
@@ -31,6 +31,7 @@ import os
 import math
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
+from scipy.spatial import ConvexHull # Import ConvexHull
 
 # Configure logger
 logger = logging.getLogger(__name__)
@@ -96,6 +97,7 @@ class LidarCompletionScenario:
         self._model_path = None
         self._output_dir = None
         self._inference_callback = None  # We'll store a function pointer here
+        self._show_reconstruction = True # Controls visibility of the output visualization
 
     def set_inference_callback(self, callback_fn):
         """
@@ -118,6 +120,7 @@ class LidarCompletionScenario:
 
     def reset(self):
         self._time_accumulator = 0.0
+        self._remove_previous_visualization() # Clean up old visualizations on reset
 
     def update(self, step):
         """
@@ -150,31 +153,41 @@ class LidarCompletionScenario:
 
         try:
             logger.info(f"[LidarCompletionScenario] Loading state dict from {self._model_path} ...")
-            
+
             # 1) Import your model class. Adjust if minimal_main_4.py is in another directory.
-            from .minimal_main_4 import FullModelSnowflake
-            
-            # 2) Instantiate the model with the same constructor args you used in training:
+            # Make sure the model definition matches the saved state_dict
+            try:
+                # Try importing the specific model used during training
+                from .minimal_main_4 import FullModelSnowflake
+            except ImportError:
+                logger.error("Could not import FullModelSnowflake from minimal_main_4.py. Ensure the file exists and is correct.")
+                self._model = None
+                return
+
+            # 2) Instantiate the model with the same constructor args used during training
+            #    These parameters MUST match the saved model's architecture.
+            #    If you change the model, update these parameters accordingly.
             self._model = FullModelSnowflake(
                 g_hidden_dims=[64, 128],
                 g_out_dim=128,
                 t_d_model=128,
                 t_nhead=8,
                 t_layers=4,
-                coarse_num=64,
-                radius=1.0
+                coarse_num=64, # Example value, adjust if needed
+                radius=1.0     # Example value, adjust if needed
+                # Add other parameters if your FullModelSnowflake requires them
             )
-            
+
             # 3) Load the state dict
             state_dict = torch.load(self._model_path, map_location="cpu")
             self._model.load_state_dict(state_dict)
-            
+
             # 4) Switch to evaluation mode for inference
             self._model.eval()
-            
+
             logger.info("[LidarCompletionScenario] Model loaded successfully (from state dict).")
         except Exception as e:
-            logger.info(f"[LidarCompletionScenario] Error loading model: {e}")
+            logger.error(f"[LidarCompletionScenario] Error loading model: {e}", exc_info=True)
             self._model = None
 
     def enable_model_application(self, enable: bool):
@@ -183,9 +196,16 @@ class LidarCompletionScenario:
         """
         self._apply_model = enable
 
-    ###########################################################################
-    # Internal Helpers
-    ###########################################################################
+    def _remove_previous_visualization(self):
+        """Removes previously generated point cloud or mesh visualizations"""
+        stage = get_current_stage()
+        point_cloud_path = "/World/ReconstructedPointCloud"
+        mesh_path = "/World/ReconstructedMesh"
+        if stage.GetPrimAtPath(point_cloud_path).IsValid():
+            omni.kit.commands.execute("DeletePrims", paths=[point_cloud_path], destructive=True)
+        if stage.GetPrimAtPath(mesh_path).IsValid():
+            omni.kit.commands.execute("DeletePrims", paths=[mesh_path], destructive=True)
+
     def _create_lidar_sensor(self):
         """
         1) Create a LiDAR sensor with IsaacSensorCreateRtxLidar, config="Example_Rotary".
@@ -240,6 +260,73 @@ class LidarCompletionScenario:
         else:
             logger.info("[LidarCompletionScenario] Could not create RtxSensorCpuIsaacCreateRTXLidarScanBuffer annotator.")
 
+    def _create_point_cloud_visualization(self, points_np):
+        """Creates a UsdGeom.Points prim from the numpy array."""
+        stage = get_current_stage()
+        point_cloud_path = "/World/ReconstructedPointCloud"
+        points_prim = UsdGeom.Points.Define(stage, point_cloud_path)
+        points_prim.CreatePointsAttr().Set(Vt.Vec3fArray.FromNumpy(points_np.astype(np.float32)))
+        points_prim.CreateWidthsAttr().Set([1.0] * len(points_np)) # Optional: control point size
+        # Set color (e.g., green)
+        points_prim.CreateDisplayColorAttr().Set([Gf.Vec3f(0, 1, 0)])
+        logger.info(f"[LidarCompletionScenario] Created point cloud visualization at {point_cloud_path}")
+
+    def _create_mesh_visualization(self, points_np):
+        """Creates a UsdGeom.Mesh prim using Convex Hull."""
+        if len(points_np) < 4: # Need at least 4 points for 3D convex hull
+            logger.info("[LidarCompletionScenario] Not enough points for mesh visualization.")
+            return
+        try:
+            hull = ConvexHull(points_np)
+            vertices = points_np[hull.vertices]
+            # The faces from ConvexHull are indices into the hull.vertices array, not the original points_np
+            faces = hull.simplices # Each row is indices of vertices forming a face (triangle)
+
+            stage = get_current_stage()
+            mesh_path = "/World/ReconstructedMesh"
+            mesh_prim = UsdGeom.Mesh.Define(stage, mesh_path)
+
+            # Set mesh properties
+            points_vt = Vt.Vec3fArray.FromNumpy(vertices.astype(np.float32))
+            mesh_prim.CreatePointsAttr().Set(points_vt)
+
+            face_vertex_counts = Vt.IntArray([3] * len(faces)) # All triangles
+            mesh_prim.CreateFaceVertexCountsAttr().Set(face_vertex_counts)
+
+            face_vertex_indices = Vt.IntArray(faces.flatten().astype(np.int32))
+            mesh_prim.CreateFaceVertexIndicesAttr().Set(face_vertex_indices)
+
+            # Set color (e.g., green-blue) and transparency
+            mesh_prim.CreateDisplayColorAttr().Set([Gf.Vec3f(0, 0.7, 0.3)])
+            # Make it slightly transparent to allow seeing the original scene through it
+            # Note: Requires a material with transparency enabled, or use UsdPreviewSurface
+            # For simplicity, we just set color here. Transparency might need material setup.
+            # primvarsApi = UsdGeom.PrimvarsAPI(mesh_prim)
+            # primvarsApi.CreatePrimvar("displayOpacity", Sdf.ValueTypeNames.Float).Set(0.5)
+
+            logger.info(f"[LidarCompletionScenario] Created mesh visualization at {mesh_path}")
+        except Exception as e:
+            logger.error(f"[LidarCompletionScenario] Error creating mesh: {e}", exc_info=True)
+
+    def _toggle_reconstruction_visibility(self, show):
+        """Toggle the visibility of the reconstructed point cloud and mesh"""
+        self._show_reconstruction = show
+        stage = get_current_stage()
+        point_cloud_path = "/World/ReconstructedPointCloud"
+        mesh_path = "/World/ReconstructedMesh"
+
+        # Toggle point cloud visibility
+        pc_prim = stage.GetPrimAtPath(point_cloud_path)
+        if pc_prim.IsValid():
+            imageable = UsdGeom.Imageable(pc_prim)
+            imageable.GetVisibilityAttr().Set(UsdGeom.Tokens.inherited if show else UsdGeom.Tokens.invisible)
+
+        # Toggle mesh visibility
+        mesh_prim = stage.GetPrimAtPath(mesh_path)
+        if mesh_prim.IsValid():
+            imageable = UsdGeom.Imageable(mesh_prim)
+            imageable.GetVisibilityAttr().Set(UsdGeom.Tokens.inherited if show else UsdGeom.Tokens.invisible)
+
     def _lidar_exists(self):
         stage = get_current_stage()
         return stage.GetPrimAtPath(self._lidar_prim_path).IsValid()
@@ -250,47 +337,13 @@ class LidarCompletionScenario:
         2) Preprocess data to match training format
         3) Run inference
         4) Save results
+        5) Visualize results in the scene
         """
-        if not self._annotator:
-            logger.info("[LidarCompletionScenario] Annotator not available. No data to fetch.")
+        # Steps 1 & 2: Get and preprocess data (moved to a separate function for clarity)
+        preprocessed_data = self._get_and_preprocess_lidar_data()
+        if preprocessed_data is None:
             return
-
-        if not self._output_dir or not os.path.exists(self._output_dir):
-            logger.info(f"[LidarCompletionScenario] Invalid output directory: {self._output_dir}")
-            return
-
-        # Get LiDAR data
-        lidar_data = self._annotator.get_data()
-        logger.info("[LidarCompletionScenario] Retrieved annotator data")
-        if not lidar_data or "data" not in lidar_data:
-            logger.info("[LidarCompletionScenario] No 'data' key in annotator output.")
-            return
-
-        points_np = lidar_data["data"]  # Nx3 float array
-        if points_np is None or len(points_np) == 0:
-            logger.info("[LidarCompletionScenario] LiDAR returned 0 points.")
-            return
-
-        # Preprocess points to match training format
-        N = points_np.shape[0]
-        num_points = 8192  # Same as training
-
-        # 1. Downsample to num_points
-        if N < num_points:
-            indices = np.random.choice(N, num_points, replace=True)
-        else:
-            indices = np.random.choice(N, num_points, replace=False)
-        
-        coords = points_np[indices]
-
-        # 2. Normalize coordinates
-        min_c = coords.min(axis=0)
-        max_c = coords.max(axis=0)
-        center = (min_c + max_c)/2
-        scale = (max_c - min_c).max()/2
-        if scale < 1e-8:
-            scale = 1.0
-        coords = (coords - center)/scale
+        full_6d, center, scale = preprocessed_data
 
         # 3. Convert to tensor and compute normals
         coords_t = torch.from_numpy(coords).float()
@@ -322,6 +375,100 @@ class LidarCompletionScenario:
         if self._inference_callback:
             self._inference_callback(out_path)
 
+        # 5. Visualize the output in the scene
+        self._visualize_output_in_scene(model_output, center, scale)
+
+    def _get_and_preprocess_lidar_data(self):
+        """Gets LiDAR data, preprocesses it, and returns tensors and normalization info."""
+        if not self._annotator:
+            logger.info("[LidarCompletionScenario] Annotator not available. No data to fetch.")
+            return None
+
+        # Get LiDAR data
+        lidar_data = self._annotator.get_data()
+        logger.info("[LidarCompletionScenario] Retrieved annotator data")
+        if not lidar_data or "data" not in lidar_data:
+            logger.info("[LidarCompletionScenario] No 'data' key in annotator output.")
+            return None
+
+        points_np = lidar_data["data"]  # Nx3 float array
+        if points_np is None or len(points_np) == 0:
+            logger.info("[LidarCompletionScenario] LiDAR returned 0 points.")
+            return None
+
+        # Preprocess points to match training format
+        N = points_np.shape[0]
+        num_points = 4096 # Match training num_points
+
+        # 1. Downsample/Upsample to num_points
+        if N == 0:
+            logger.warning("[LidarCompletionScenario] No points received from LiDAR.")
+            return None
+        elif N < num_points:
+            indices = np.random.choice(N, num_points, replace=True)
+        else:
+            indices = np.random.choice(N, num_points, replace=False)
+        coords = points_np[indices]
+
+        # 2. Normalize coordinates
+        center = np.mean(coords, axis=0)
+        coords_centered = coords - center
+        scale = np.max(np.linalg.norm(coords_centered, axis=1))
+        if scale < 1e-8: scale = 1.0 # Avoid division by zero
+        coords_normalized = coords_centered / scale
+
+        # 3. Convert to tensor and compute normals (on normalized data)
+        coords_t = torch.from_numpy(coords_normalized).float()
+        normals_t = compute_normals_pca(coords_t, k=16)  # Same k as training
+
+        # 4. Combine coordinates and normals
+        full_6d = torch.cat([coords_t, normals_t], dim=-1)  # => [N,6]
+
+        return full_6d, center, scale # Return normalization info
+
+    def _visualize_output_in_scene(self, model_output, center, scale):
+        """
+        De-normalizes the model output and adds it to the scene as points and/or mesh.
+        Args:
+            model_output: The raw output tensor from the model. [B, C, N] or [B, N, C]
+            center: Original center used for normalization
+            scale: Original scale used for normalization
+        """
+        if model_output is None:
+            logger.info("[LidarCompletionScenario] No model output to visualize")
+            return
+
+        # 1. De-normalize points back to world space
+        # Handle potential batch dimension and channel dimension
+        if model_output.dim() == 3:
+            if model_output.size(1) == 3: # Shape [B, 3, N]
+                output_points = model_output.squeeze(0).permute(1, 0) # -> [N, 3]
+            elif model_output.size(2) == 3: # Shape [B, N, 3]
+                output_points = model_output.squeeze(0) # -> [N, 3]
+            else:
+                 logger.error(f"Unexpected model output shape: {model_output.shape}")
+                 return
+        elif model_output.dim() == 2 and model_output.size(1) == 3: # Shape [N, 3]
+            output_points = model_output
+        else:
+            logger.error(f"Unexpected model output shape: {model_output.shape}")
+            return
+
+        points_np = output_points.detach().cpu().numpy()
+
+        # Apply inverse normalization
+        points_np = points_np * scale + center
+
+        # 2. Remove previous visualizations
+        self._remove_previous_visualization()
+
+        # 3. Create new visualizations if enabled
+        if self._show_reconstruction:
+            self._create_point_cloud_visualization(points_np)
+            # self._create_mesh_visualization(points_np) # Optionally create mesh
+
+        logger.info(f"[LidarCompletionScenario] Visualized output with {points_np.shape[0]} points.")
+
 ###############################################################################
 # EXTENSION UI - SAME TEMPLATE, ADDED ANNOTATOR LOGIC
 ###############################################################################
@@ -339,12 +486,24 @@ class UIBuilder:
         pass
 
     def on_timeline_event(self, event):
+        """Callback for Timeline events (Play, Pause, Stop)."""
         import omni.timeline
         if event.type == int(omni.timeline.TimelineEventType.STOP):
+            # Ensure visualization is removed when simulation stops
+            if self._scenario:
+                self._scenario._remove_previous_visualization()
             self._scenario_state_btn.reset()
             self._scenario_state_btn.enabled = False
+        elif event.type == int(omni.timeline.TimelineEventType.PAUSE):
+             # If paused, keep visualization but stop updates
+             pass
+        elif event.type == int(omni.timeline.TimelineEventType.PLAY):
+             # Ensure button state is correct if played from outside the extension
+             if hasattr(self, "_scenario_state_btn"):
+                 self._scenario_state_btn.set_state_b() # Set to STOP
 
     def on_physics_step(self, step: float):
+        """Forward the physics step to the scenario's update method."""
         pass
 
     def on_stage_event(self, event):
@@ -352,8 +511,16 @@ class UIBuilder:
             self._reset_extension()
 
     def cleanup(self):
+        """Clean up resources."""
+        # Remove visualization prims
+        if self._scenario:
+            self._scenario._remove_previous_visualization()
+        # Clean up UI elements
         for ui_elem in self.wrapped_ui_elements:
             ui_elem.cleanup()
+        self.wrapped_ui_elements.clear()
+        # Reset internal state if necessary
+        self._scenario = None # Or re-initialize if needed
 
     def build_ui(self):
         """
@@ -388,6 +555,15 @@ class UIBuilder:
                     self._output_dir_field = ui.StringField(height=0)
                 ui.Button("APPLY MODEL", height=0, clicked_fn=self._on_apply_model_clicked)
 
+                # Add a toggle for visualization
+                with ui.HStack(spacing=5):
+                    ui.Label("Show Reconstruction:", width=130)
+                    self._show_reconstruction_checkbox = ui.CheckBox(
+                        model=ui.SimpleBoolModel(self._scenario._show_reconstruction) # Use scenario's state
+                    )
+                    # Link checkbox changes to the scenario's visibility toggle method
+                    self._show_reconstruction_checkbox.model.add_value_changed_fn(self._on_show_reconstruction_changed)
+
         run_scenario_frame = CollapsableFrame("Run Scenario")
         with run_scenario_frame:
             with ui.VStack(style=get_style(), spacing=5, height=0):
@@ -417,10 +593,16 @@ class UIBuilder:
     # Extension Lifecycle
     ######################################################################################
     def _on_init(self):
-        pass
+        self._timeline = omni.timeline.get_timeline_interface()
+        # Keep a reference to the scenario instance
+        self._scenario = LidarCompletionScenario()
+        # Pass the UI update function to the scenario
+        self._scenario.set_inference_callback(self._on_inference_complete)
 
     def _add_light_to_stage(self):
+        """Adds a default light to the stage"""
         sphereLight = UsdLux.SphereLight.Define(get_current_stage(), Sdf.Path("/World/SphereLight"))
+        # Make the light visible in the stage tree
         sphereLight.CreateRadiusAttr(2)
         sphereLight.CreateIntensityAttr(100000)
         SingleXFormPrim(str(sphereLight.GetPath())).set_world_pose([6.5, 0, 12])
@@ -433,9 +615,18 @@ class UIBuilder:
         world = World.instance()
         for obj in loaded_objects:
             world.scene.add(obj)
+        # Reset the scenario state after loading
+        self._scenario.reset()
 
     def _setup_scenario(self):
+        """Called after scene is loaded or reset, prepares the scenario."""
+        if not self._scenario:
+             self._scenario = LidarCompletionScenario()
+             self._scenario.set_inference_callback(self._on_inference_complete)
+
         self._scenario.setup()
+        # Update UI state
+
         self._scenario_state_btn.reset()
         self._scenario_state_btn.enabled = True
         self._reset_btn.enabled = True
@@ -445,11 +636,17 @@ class UIBuilder:
         self._scenario.set_inference_callback(self._on_inference_complete)
 
     def _on_post_reset_btn(self):
+        """Callback when reset button is clicked."""
+        # Reset the scenario
         self._scenario.reset()
+        # Reset the UI button state
         self._scenario_state_btn.reset()
         self._scenario_state_btn.enabled = True
 
     def _update_scenario(self, step: float):
+        """Callback for physics steps, forwards to scenario."""
+        if not self._scenario:
+            return
         done = self._scenario.update(step)
         if done:
             self._scenario_state_btn.enabled = False
@@ -461,13 +658,28 @@ class UIBuilder:
         self._timeline.pause()
 
     def _reset_extension(self):
+        """Resets the entire extension state, often called on stage change."""
+        # Clean up existing scenario and visualizations
+        if self._scenario:
+            self._scenario._remove_previous_visualization()
+            # Potentially add more scenario cleanup if needed
+
+        # Re-initialize the scenario
         self._scenario = LidarCompletionScenario()
+        self._scenario.set_inference_callback(self._on_inference_complete)
+
+        # Reset UI elements
         self._reset_ui()
 
     def _reset_ui(self):
-        self._scenario_state_btn.reset()
-        self._scenario_state_btn.enabled = False
-        self._reset_btn.enabled = False
+        """Resets the UI elements to their initial state."""
+        if hasattr(self, "_scenario_state_btn"):
+            self._scenario_state_btn.reset()
+            self._scenario_state_btn.enabled = False
+        if hasattr(self, "_reset_btn"):
+            self._reset_btn.enabled = False
+        self._inference_label.text = "No inference results yet."
+        self._inference_image.source_url = "" # Clear the image
 
     def _on_apply_model_clicked(self):
         model_path = self._model_path_field.model.get_value_as_string()
@@ -478,10 +690,18 @@ class UIBuilder:
         self._scenario.load_model()
 
         self._scenario.enable_model_application(True)
+        logger.info(f"Model applied: {model_path}, Output dir: {output_dir}")
 
         # Optionally auto-play
         if not self._timeline.is_playing():
             self._timeline.play()
+            # Ensure the run button state reflects playing state
+            if hasattr(self, "_scenario_state_btn"):
+                 self._scenario_state_btn.set_state_b() # Set to STOP state
+                 self._scenario_state_btn.enabled = True
+
+    def _on_show_reconstruction_changed(self, model):
+        self._scenario._toggle_reconstruction_visibility(model.get_value_as_bool())
 
     def _on_inference_complete(self, pt_path):
         """
@@ -499,13 +719,17 @@ class UIBuilder:
             # 1) Load the saved data (input, output, center, scale, etc.)
             data = torch.load(pt_path, map_location="cpu")
             input_tensor = data.get("input", None)   # shape [N,6] (xyz + normal)
-            output_tensor = data.get("output", None) # shape could vary, e.g. [N,3] or [1,N,3]
+            output_tensor = data.get("output", None) # shape could vary, e.g. [B, C, N] or [B, N, C]
+            center = data.get('center', np.zeros(3)) # Default to origin if not saved
+            scale = data.get('scale', 1.0)           # Default to 1.0 if not saved
 
             if input_tensor is None:
                 self._inference_label.text = "No 'input' found in PT file."
                 return
 
             # -- Extract input points (x,y,z) from the first 3 channels of 'input'
+            # De-normalize for plotting
+            points_in_norm = input_tensor[:, :3]
             points_in = input_tensor.detach().cpu()[:, :3]  # [N,3]
             logger.info("[LidarCompletionScenario] Input tensor shape: %s", points_in.shape)
             x_in = points_in[:, 0].numpy()
@@ -513,17 +737,22 @@ class UIBuilder:
             z_in = points_in[:, 2].numpy()
 
             # -- Extract output points
+            x_out, y_out, z_out = None, None, None
+            points_out_norm = None
+            points_out = None # Initialize points_out
             if output_tensor is not None:
-                # If your model_output is shape [1,N,3], remove the batch dim:
-                if output_tensor.dim() == 3 and output_tensor.size(0) == 1:
-                    output_tensor = output_tensor.squeeze(0)  # now [N,3]
-                points_out = output_tensor.detach().cpu()[..., :3]  # if it's Nx3
+                # Handle potential batch and channel dimensions
+                if output_tensor.dim() == 3:
+                    if output_tensor.size(1) == 3: # Shape [B, 3, N]
+                        points_out_norm = output_tensor.squeeze(0).permute(1, 0) # -> [N, 3]
+                    elif output_tensor.size(2) == 3: # Shape [B, N, 3]
+                        points_out_norm = output_tensor.squeeze(0) # -> [N, 3]
+                elif output_tensor.dim() == 2 and output_tensor.size(1) == 3: # Shape [N, 3]
+                    points_out_norm = output_tensor
+
+                points_out = points_out_norm.detach().cpu() # Keep CPU tensor for plotting
                 logger.info("[LidarCompletionScenario] Output tensor shape: %s", points_out.shape)
-                x_out = points_out[:, 0].detach().cpu().numpy()
-                y_out = points_out[:, 1].detach().cpu().numpy()
-                z_out = points_out[:, 2].detach().cpu().numpy()
-            else:
-                x_out = y_out = z_out = None
+                x_out, y_out, z_out = points_out[:, 0].numpy(), points_out[:, 1].numpy(), points_out[:, 2].numpy()
 
             # 2) Create a single figure with two subplots, side by side
             fig = plt.figure(figsize=(8,4), dpi=100)
@@ -531,7 +760,7 @@ class UIBuilder:
             # Left subplot for Input
             ax1 = fig.add_subplot(121, projection='3d')
             ax1.scatter(x_in, y_in, z_in, s=1, c='blue')
-            ax1.set_title("Input")
+            ax1.set_title("Input (Normalized)")
             ax1.set_xlabel("X")
             ax1.set_ylabel("Y")
             ax1.set_zlabel("Z")
@@ -541,20 +770,20 @@ class UIBuilder:
             ax2 = fig.add_subplot(122, projection='3d')
             if x_out is not None:
                 ax2.scatter(x_out, y_out, z_out, s=1, c='red')
-            ax2.set_title("Output" if x_out is not None else "No Output")
+            ax2.set_title("Output (Normalized)" if x_out is not None else "No Output")
             ax2.set_xlabel("X")
             ax2.set_ylabel("Y")
             ax2.set_zlabel("Z")
             ax2.view_init(elev=30, azim=-60)
 
             # Optionally unify coordinate scales so both subplots match
-            # Combine all points
-            if x_out is not None:
-                combined = torch.cat([points_in, points_out], dim=0).numpy()
+            # Combine normalized points for consistent plot scaling
+            if points_out_norm is not None:
+                combined_norm = torch.cat([points_in_norm, points_out_norm], dim=0).numpy()
             else:
-                combined = points_in.numpy()
-            min_vals = combined.min(axis=0)
-            max_vals = combined.max(axis=0)
+                combined_norm = points_in_norm.numpy()
+            min_vals = combined_norm.min(axis=0)
+            max_vals = combined_norm.max(axis=0)
             for ax in [ax1, ax2]:
                 ax.set_xlim(min_vals[0], max_vals[0])
                 ax.set_ylim(min_vals[1], max_vals[1])
@@ -571,4 +800,12 @@ class UIBuilder:
             self._inference_image.source_url = temp_path
 
         except Exception as e:
-            self._inference_label.text = f"Error loading {pt_path}: {e}"
+            self._inference_label.text = f"Error loading/plotting {pt_path}: {e}"
+            logger.error(f"Error processing inference result {pt_path}: {e}", exc_info=True)
+        finally:
+            # Clean up the temporary file if it exists
+            if 'temp_path' in locals() and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError as e:
+                    logger.error(f"Error removing temporary file {temp_path}: {e}")
