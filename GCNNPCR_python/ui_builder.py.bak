@@ -1,0 +1,386 @@
+# -*- coding: utf-8 -*-
+
+# Copyright (c) 2022-2024, NVIDIA CORPORATION.
+#
+# NVIDIA CORPORATION and its licensors retain all intellectual property
+# and proprietary rights in and to this software, related documentation
+# and any modifications thereto. Any use, reproduction, disclosure or
+# distribution of this software and related documentation without an express
+# license agreement from NVIDIA CORPORATION is strictly prohibited.
+#
+
+import omni.timeline
+import omni.ui as ui
+from isaacsim.core.api.world import World
+from isaacsim.core.prims import SingleXFormPrim
+from isaacsim.core.utils.stage import create_new_stage, get_current_stage
+from isaacsim.examples.extension.core_connectors import LoadButton, ResetButton
+from isaacsim.gui.components.element_wrappers import CollapsableFrame, StateButton
+from isaacsim.gui.components.ui_utils import get_style
+from omni.usd import StageEventType
+from pxr import Sdf, UsdLux
+
+import omni.kit.commands
+import omni.replicator.core as rep
+from pxr import Gf
+
+import torch
+import os
+import math
+
+###############################################################################
+# A Scenario Class Using RTX Lidar
+###############################################################################
+class LidarCompletionScenario:
+
+    def __init__(self):
+        self._lidar_prim_path = "/World/RTXLidarSensor"
+        self._render_product = None
+        self._annotator = None
+        self._writer = None
+
+        # For rotation tracking:
+        self._rotation_angle = 0.0
+        self._rotation_speed = math.radians(2.0)  # e.g. 2 deg per step
+
+        # Model-related
+        self._model = None
+        self._model_path = None
+        self._output_dir = None
+        self._apply_model = False
+
+    def load_example_assets(self):
+        """Return an empty list or optional objects to add to the scene (e.g. ground plane)."""
+        return []
+
+    def setup(self):
+        """
+        Create a new RTX Lidar camera prim in the scene, 
+        set up a render product, an annotator, and an optional debug-draw writer.
+        """
+        self._create_rtx_lidar()
+        self.reset()
+
+    def reset(self):
+        self._rotation_angle = 0.0
+
+    def update(self, dt):
+
+        if not self._lidar_exists():
+            return False
+
+        self._rotation_angle += self._rotation_speed
+        current_deg = math.degrees(self._rotation_angle)
+
+        # Rotate the Lidar around Z axis:
+        xform = SingleXFormPrim(self._lidar_prim_path)
+        xform.set_local_rotation([0, 0, self._rotation_angle])
+
+        if current_deg >= 360.0:
+            self._rotation_angle = 0.0
+            if self._apply_model and self._model is not None:
+                self._run_inference_and_save()
+
+        return False
+
+    def set_model_path(self, model_path):
+        self._model_path = model_path
+
+    def set_output_dir(self, output_dir):
+        self._output_dir = output_dir
+
+    def load_model(self):
+        """Load the .pth PyTorch model if a valid path is provided."""
+        if not self._model_path or not os.path.exists(self._model_path):
+            print(f"[LidarCompletionScenario] Invalid model path {self._model_path}")
+            self._model = None
+            return
+
+        try:
+            print(f"[LidarCompletionScenario] Loading model from {self._model_path}...")
+            self._model = torch.load(self._model_path, map_location="cpu")
+            self._model.eval()
+            print("[LidarCompletionScenario] Model loaded successfully.")
+        except Exception as e:
+            print(f"[LidarCompletionScenario] Error loading model: {e}")
+            self._model = None
+
+    def enable_model_application(self, enable: bool):
+        """Call when the user wants to enable or disable applying the model on each full rotation."""
+        self._apply_model = enable
+
+    ###########################################################################
+    # Internal Helpers
+    ###########################################################################
+    def _create_rtx_lidar(self):
+        """
+        Create an RTX Lidar camera prim using the IsaacSensorCreateRtxLidar command.
+        Attach a render product, an annotator for point cloud data, and an optional debug-draw writer.
+        """
+        # 1) Create Lidar sensor prim
+        #    The config can be changed to your liking, e.g. "Example_Rotary", "Example_Fixed", etc.
+        lidar_config = "Example_Rotary"
+        result, sensor = omni.kit.commands.execute(
+            "IsaacSensorCreateRtxLidar",
+            path=self._lidar_prim_path,
+            parent=None,
+            config=lidar_config,
+            translation=(0, 0, 0),
+            orientation=Gf.Quatd(1, 0, 0, 0),
+        )
+        if not result:
+            print("[LidarCompletionScenario] Failed to create RTX Lidar sensor.")
+            return
+
+        # 2) Create the render product referencing the newly created sensor
+        self._render_product = rep.create.render_product(
+            sensor.GetPath(), resolution=[1, 1]
+        )
+
+        # 3) Create the annotator to read the data with `annotator.get_data()`
+        self._annotator = rep.AnnotatorRegistry.get_annotator("RtxSensorCpuIsaacCreateRTXLidarScanBuffer")
+        if self._annotator:
+            self._annotator.attach(self._render_product)
+        else:
+            print("[LidarCompletionScenario] Could not get RtxSensorCpuIsaacCreateRTXLidarScanBuffer annotator.")
+
+        # 4) (Optional) Create a debug-draw writer that visually places points in the scene
+        self._writer = rep.writers.get("RtxLidarDebugDrawPointCloudBuffer")
+        if self._writer:
+            self._writer.attach(self._render_product)
+
+    def _lidar_exists(self):
+        stage = get_current_stage()
+        return stage.GetPrimAtPath(self._lidar_prim_path).IsValid()
+
+    def _run_inference_and_save(self):
+        """
+        Fetch the LiDAR scan from the annotator. 
+        Convert to a PyTorch tensor, run the model, and save results to disk.
+        """
+        if not self._annotator:
+            print("[LidarCompletionScenario] Annotator not created. No data to fetch.")
+            return
+
+        # Force replicator to update the pipeline so we have fresh data
+        # Typically, when the timeline is playing, these get updated each frame.
+        rep.orchestrator.step()
+
+        lidar_data = self._annotator.get_data()
+        if not lidar_data or "points" not in lidar_data:
+            print("[LidarCompletionScenario] No 'points' data found in annotator.")
+            return
+
+        points_np = lidar_data["points"]  # Typically a NumPy array shaped (N, 3)
+        if points_np is None or len(points_np) == 0:
+            print("[LidarCompletionScenario] Empty point data from LiDAR.")
+            return
+
+        points_tensor = torch.from_numpy(points_np).float()
+
+        # 2) Run the model
+        try:
+            output = self._model(points_tensor.unsqueeze(0))  # example shape: (1, N, 3?), adapt as needed
+        except Exception as e:
+            print(f"[LidarCompletionScenario] Model inference error: {e}")
+            return
+
+        # 3) Save the results
+        if not self._output_dir or not os.path.exists(self._output_dir):
+            print(f"[LidarCompletionScenario] Invalid output directory: {self._output_dir}")
+            return
+
+        out_path = os.path.join(self._output_dir, "model_output.pt")
+        torch.save(output, out_path)
+        print(f"[LidarCompletionScenario] Model output saved to {out_path}")
+
+###############################################################################
+# Isaac Sim UI Extension Template (Provided Structure)
+###############################################################################
+
+class UIBuilder:
+    def __init__(self):
+        self.frames = []
+        self.wrapped_ui_elements = []
+        self._timeline = omni.timeline.get_timeline_interface()
+
+        # Our custom scenario that uses an RTX Lidar
+        self._scenario = LidarCompletionScenario()
+
+        self._on_init()
+
+    ###################################################################################
+    #           The Functions Below Are Called Automatically By extension.py
+    ###################################################################################
+
+    def on_menu_callback(self):
+        pass
+
+    def on_timeline_event(self, event):
+        """Callback for Timeline events (Play, Pause, Stop)."""
+        import omni.timeline
+        if event.type == int(omni.timeline.TimelineEventType.STOP):
+            self._scenario_state_btn.reset()
+            self._scenario_state_btn.enabled = False
+
+    def on_physics_step(self, step: float):
+        pass
+
+    def on_stage_event(self, event):
+        from omni.usd import StageEventType
+        if event.type == int(StageEventType.OPENED):
+            self._reset_extension()
+
+    def cleanup(self):
+        for ui_elem in self.wrapped_ui_elements:
+            ui_elem.cleanup()
+
+    def build_ui(self):
+        """
+        Build a custom UI for the extension. 
+        """
+        # 1) Basic Load/Reset
+        world_controls_frame = CollapsableFrame("World Controls", collapsed=False)
+        with world_controls_frame:
+            with ui.VStack(style=get_style(), spacing=5, height=0):
+                self._load_btn = LoadButton(
+                    "Load Button", "LOAD", setup_scene_fn=self._setup_scene, setup_post_load_fn=self._setup_scenario
+                )
+                self._load_btn.set_world_settings(physics_dt=1 / 60.0, rendering_dt=1 / 60.0)
+                self.wrapped_ui_elements.append(self._load_btn)
+
+                self._reset_btn = ResetButton(
+                    "Reset Button", "RESET", pre_reset_fn=None, post_reset_fn=self._on_post_reset_btn
+                )
+                self._reset_btn.enabled = False
+                self.wrapped_ui_elements.append(self._reset_btn)
+
+        # 2) Model selection & Apply
+        model_frame = CollapsableFrame("Model & Lidar Inference", collapsed=False)
+        with model_frame:
+            with ui.VStack(style=get_style(), spacing=5, height=0):
+                # Model path
+                with ui.HStack(spacing=5):
+                    ui.Label("Model Path:", width=100)
+                    self._model_path_field = ui.StringField(height=0)
+
+                # Output directory
+                with ui.HStack(spacing=5):
+                    ui.Label("Output Dir:", width=100)
+                    self._output_dir_field = ui.StringField(height=0)
+
+                # Apply button
+                self._apply_model_btn = ui.Button("APPLY MODEL", height=0, clicked_fn=self._on_apply_model_clicked)
+
+        # 3) Run Scenario
+        run_scenario_frame = CollapsableFrame("Run Scenario")
+        with run_scenario_frame:
+            with ui.VStack(style=get_style(), spacing=5, height=0):
+                self._scenario_state_btn = StateButton(
+                    "Run Scenario",
+                    "RUN",
+                    "STOP",
+                    on_a_click_fn=self._on_run_scenario_a_text,
+                    on_b_click_fn=self._on_run_scenario_b_text,
+                    physics_callback_fn=self._update_scenario,
+                )
+                self._scenario_state_btn.enabled = False
+                self.wrapped_ui_elements.append(self._scenario_state_btn)
+
+    ######################################################################################
+    # Example / Template-Specific Methods
+    ######################################################################################
+
+    def _on_init(self):
+        pass
+
+    def _add_light_to_stage(self):
+        """A new stage does not have a light by default."""
+        sphereLight = UsdLux.SphereLight.Define(get_current_stage(), Sdf.Path("/World/SphereLight"))
+        sphereLight.CreateRadiusAttr(2)
+        sphereLight.CreateIntensityAttr(100000)
+        SingleXFormPrim(str(sphereLight.GetPath())).set_world_pose([6.5, 0, 12])
+
+    def _setup_scene(self):
+        """
+        Called by the 'Load' button (setup_scene_fn).
+        Creates a new USD stage, adds a light, 
+        and loads scenario assets (if any).
+        """
+        create_new_stage()
+        self._add_light_to_stage()
+
+        loaded_objects = self._scenario.load_example_assets()
+        world = World.instance()
+        for obj in loaded_objects:
+            world.scene.add(obj)
+
+    def _setup_scenario(self):
+        """
+        Called by the 'Load' button (setup_post_load_fn) 
+        after _setup_scene() finishes.
+        """
+        self._scenario.setup()
+
+        # UI
+        self._scenario_state_btn.reset()
+        self._scenario_state_btn.enabled = True
+        self._reset_btn.enabled = True
+
+    def _on_post_reset_btn(self):
+        """
+        Called by the Reset Button (post_reset_fn) after the world is reset.
+        """
+        self._scenario.reset()
+
+        # UI
+        self._scenario_state_btn.reset()
+        self._scenario_state_btn.enabled = True
+
+    def _update_scenario(self, step: float):
+        """Called every physics frame while "RUN" is active."""
+        done = self._scenario.update(step)
+        if done:
+            self._scenario_state_btn.enabled = False
+
+    def _on_run_scenario_a_text(self):
+        """When the user clicks 'RUN'."""
+        self._timeline.play()
+
+    def _on_run_scenario_b_text(self):
+        """When the user clicks 'STOP'."""
+        self._timeline.pause()
+
+    def _reset_extension(self):
+        """Reset everything if a new stage is opened."""
+        self._scenario = LidarCompletionScenario()
+        self._reset_ui()
+
+    def _reset_ui(self):
+        self._scenario_state_btn.reset()
+        self._scenario_state_btn.enabled = False
+        self._reset_btn.enabled = False
+
+    ###########################################################################
+    # "Apply Model" logic
+    ###########################################################################
+    def _on_apply_model_clicked(self):
+        """
+        Called when the user clicks the "APPLY MODEL" button:
+        1) Read fields for model path, output dir
+        2) Load .pth model
+        3) Enable model inference
+        4) (Optionally) auto-run scenario
+        """
+        model_path = self._model_path_field.model.get_value_as_string()
+        output_dir = self._output_dir_field.model.get_value_as_string()
+
+        self._scenario.set_model_path(model_path)
+        self._scenario.set_output_dir(output_dir)
+        self._scenario.load_model()
+
+        self._scenario.enable_model_application(True)
+
+        # If desired, automatically play to start capturing LiDAR frames
+        if not self._timeline.is_playing():
+            self._timeline.play()
