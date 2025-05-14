@@ -31,8 +31,9 @@ import os
 import math
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
-from scipy.spatial import ConvexHull # Import ConvexHull
 from scipy.spatial.distance import cdist # For distance calculation
+# from scipy.spatial import ConvexHull  # no longer needed
+import open3d as o3d  # for alpha‐shape concave hull
 
 # Configure logger
 logger = logging.getLogger(__name__)
@@ -274,20 +275,19 @@ class LidarCompletionScenario:
             logger.info("[LidarCompletionScenario] Could not create RtxSensorCpuIsaacCreateRTXLidarScanBuffer annotator.")
 
     def _create_mesh_visualization(self, points_np):
-        """Creates a UsdGeom.Mesh prim using Convex Hull for faces and colors vertices based on nearest scene mesh."""
-        if len(points_np) < 4: # Need at least 4 points for 3D convex hull
+        """Creates a UsdGeom.Mesh prim using Concave Hull (alpha shape)."""
+        if len(points_np) < 4:
             logger.info("[LidarCompletionScenario] Not enough points for mesh visualization.")
             return
         try:
-            # --- Use ALL points_np as vertices ---
-            vertices_world = points_np # Use all points directly
+            # --- Compute Concave Hull via alpha‐shape ---
+            alpha = 0.03  # adjust to control concavity
+            pcd_o3d = o3d.geometry.PointCloud()
+            pcd_o3d.points = o3d.utility.Vector3dVector(points_np.astype(np.float64))
+            mesh_o3d = o3d.geometry.TriangleMesh.create_from_point_cloud_alpha_shape(pcd_o3d, alpha)
+            vertices_world = np.asarray(mesh_o3d.vertices)     # concave hull vertices
+            faces = np.asarray(mesh_o3d.triangles)            # triangle indices
             num_vertices = len(vertices_world)
-
-            # --- Convex Hull for faces ONLY ---
-            # Calculate hull on all points to get face indices
-            hull = ConvexHull(points_np)
-            # faces are indices into the original points_np (which is now vertices_world)
-            faces = hull.simplices
 
             stage = get_current_stage()
             mesh_path = "/World/ReconstructedMesh"
@@ -376,7 +376,7 @@ class LidarCompletionScenario:
 
             logger.info(f"[LidarCompletionScenario] Created mesh visualization at {mesh_path} with {num_vertices} vertices and vertex colors.")
         except Exception as e:
-            # Convex hull can fail if points are degenerate (e.g., co-planar)
+            # Concave hull can fail if points are degenerate (e.g., co-planar)
             logger.error(f"[LidarCompletionScenario] Error creating mesh visualization: {e}", exc_info=True)
 
     def _toggle_completed_mesh_visibility(self, show):
