@@ -16,7 +16,7 @@ from isaacsim.examples.extension.core_connectors import LoadButton, ResetButton
 from isaacsim.gui.components.element_wrappers import CollapsableFrame, StateButton
 from isaacsim.gui.components.ui_utils import get_style
 from omni.usd import StageEventType
-from pxr import Sdf, UsdLux, Gf, UsdGeom, Vt, UsdShade # Import UsdShade for materials
+from pxr import Sdf, UsdLux, Gf, UsdGeom, Vt, UsdShade, Usd # Import Usd
 import logging
 import matplotlib
 import matplotlib.pyplot as plt
@@ -179,8 +179,22 @@ class LidarCompletionScenario:
                 # Add other parameters if your FullModelSnowflake requires them
             )
 
-            # 3) Load the state dict
-            state_dict = torch.load(self._model_path, map_location="cpu")
+            # 3) Load the checkpoint dictionary - ADD weights_only=True for security
+            # Note: This assumes your checkpoint ONLY contains model weights/state_dict
+            # and does not rely on loading arbitrary pickled Python objects.
+            # If loading fails, you might need weights_only=False, but be aware of security risks.
+            checkpoint = torch.load(self._model_path, map_location="cpu")#, weights_only=True)
+
+            # Check if the checkpoint is a dictionary containing the model state
+            if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+                state_dict = checkpoint["model_state_dict"]
+                logger.info("[LidarCompletionScenario] Extracted 'model_state_dict' from checkpoint.")
+            else:
+                # Assume the loaded object is the state_dict itself (less likely based on error)
+                state_dict = checkpoint
+                logger.warning("[LidarCompletionScenario] Checkpoint does not contain 'model_state_dict' key. Attempting to load directly.")
+
+            # Load the extracted state dict
             self._model.load_state_dict(state_dict)
 
             # 4) Switch to evaluation mode for inference
@@ -241,50 +255,58 @@ class LidarCompletionScenario:
         # (4) Create & initialize the annotator so we can retrieve point cloud data
         self._annotator = rep.AnnotatorRegistry.get_annotator("RtxSensorCpuIsaacCreateRTXLidarScanBuffer")
         if self._annotator:
-            # Configure the annotator. For example, we want world-space positions, 
-            # plus distance, intensity, etc. (You can enable or disable fields as needed.)
+            # Configure the annotator. Simplify to only request necessary data for debug draw.
+            logger.info("[LidarCompletionScenario] Initializing annotator (simplified for debug draw)...")
             self._annotator.initialize(
-                transformPoints=True,
+                transformPoints=True,      # Get world-space points (needed for debug draw)
                 keepOnlyPositiveDistance=True,
                 outputDistance=True,
-                outputIntensity=True,
+                outputIntensity=False,
                 outputAzimuth=True,
                 outputElevation=True,
-                outputNormal=False,       # or True if you want surface normals
-                outputObjectId=False,     # or True if you need the object IDs
-                outputTimestamp=False,    # or True if you need time info
+                outputNormal=False,
+                outputObjectId=False,
+                outputTimestamp=False,
             )
             self._annotator.attach(self._render_product)
+            logger.info("[LidarCompletionScenario] Annotator initialized and attached.")
         else:
             logger.info("[LidarCompletionScenario] Could not create RtxSensorCpuIsaacCreateRTXLidarScanBuffer annotator.")
 
     def _create_mesh_visualization(self, points_np):
-        """Creates a UsdGeom.Mesh prim using Convex Hull and colors vertices based on nearest scene mesh."""
+        """Creates a UsdGeom.Mesh prim using Convex Hull for faces and colors vertices based on nearest scene mesh."""
         if len(points_np) < 4: # Need at least 4 points for 3D convex hull
             logger.info("[LidarCompletionScenario] Not enough points for mesh visualization.")
             return
         try:
-            # --- Convex Hull remains the same ---
+            # --- Use ALL points_np as vertices ---
+            vertices_world = points_np # Use all points directly
+            num_vertices = len(vertices_world)
+
+            # --- Convex Hull for faces ONLY ---
+            # Calculate hull on all points to get face indices
             hull = ConvexHull(points_np)
-            # Use all points from the convex hull as vertices for color calculation
-            vertices_world = points_np[hull.vertices]
-            faces = hull.simplices # Indices into vertices_world
+            # faces are indices into the original points_np (which is now vertices_world)
+            faces = hull.simplices
 
             stage = get_current_stage()
             mesh_path = "/World/ReconstructedMesh"
             mesh_prim = UsdGeom.Mesh.Define(stage, mesh_path)
 
             # --- Set basic mesh properties ---
+            # Set ALL points as vertices
             points_vt = Vt.Vec3fArray.FromNumpy(vertices_world.astype(np.float32))
             mesh_prim.CreatePointsAttr().Set(points_vt)
 
             face_vertex_counts = Vt.IntArray([3] * len(faces)) # All triangles
             mesh_prim.CreateFaceVertexCountsAttr().Set(face_vertex_counts)
 
-            face_vertex_indices = Vt.IntArray(faces.flatten().astype(np.int32))
+            # Face indices now directly reference the full vertices_world array
+            face_vertex_indices_list = faces.flatten().astype(np.int32).tolist()
+            face_vertex_indices = Vt.IntArray(face_vertex_indices_list)
             mesh_prim.CreateFaceVertexIndicesAttr().Set(face_vertex_indices)
 
-            # --- Vertex Color Calculation ---
+            # --- Vertex Color Calculation (for ALL vertices) ---
             target_prims = []
             target_centers_world = []
             target_colors = []
@@ -315,39 +337,44 @@ class LidarCompletionScenario:
             vertex_colors_list = []
             if target_centers_world:
                 target_centers_np = np.array(target_centers_world) # Shape [M, 3]
-                # Calculate distances between all vertices and all target centers
+                # Calculate distances between ALL vertices and all target centers
                 # vertices_world shape: [N, 3], target_centers_np shape: [M, 3]
                 dist_matrix = cdist(vertices_world, target_centers_np) # Shape [N, M]
                 # Find the index of the closest target center for each vertex
                 nearest_indices = np.argmin(dist_matrix, axis=1) # Shape [N]
 
-                # Assign colors based on the nearest prim
+                # Assign colors based on the nearest prim (for ALL N vertices)
                 for idx in nearest_indices:
                     vertex_colors_list.append(target_colors[idx])
             else:
                 # If no target meshes found, assign default color to all vertices
                 logger.info("[LidarCompletionScenario] No target meshes found for color coding. Using default color.")
-                vertex_colors_list = [default_color] * len(vertices_world)
+                vertex_colors_list = [default_color] * num_vertices # Use num_vertices
 
-            # --- Apply Vertex Colors ---
-            if vertex_colors_list:
+            # --- Apply Vertex Colors (for ALL vertices) ---
+            if len(vertex_colors_list) == num_vertices: # Ensure we have the correct number of colors
                 vertex_colors_vt = Vt.Vec3fArray(vertex_colors_list)
-                # Create or get the primvar for displayColor
-                color_primvar = mesh_prim.CreatePrimvar("primvars:displayColor", Sdf.ValueTypeNames.Color3fArray, UsdGeom.Tokens.vertex)
+                # Get the PrimvarsAPI for the mesh
+                primvars_api = UsdGeom.PrimvarsAPI(mesh_prim)
+                # Create or get the primvar for displayColor using the PrimvarsAPI
+                color_primvar = primvars_api.CreatePrimvar("primvars:displayColor", Sdf.ValueTypeNames.Color3fArray, UsdGeom.Tokens.vertex)
                 color_primvar.Set(vertex_colors_vt)
                 # color_primvar.SetInterpolation(UsdGeom.Tokens.vertex) # Set interpolation explicitly if needed, often inferred
 
             # Remove the single mesh color attribute if it exists or was previously set
-            # mesh_prim.RemoveProperty("primvars:displayColor") # If previously set with different interpolation
-            if mesh_prim.GetAttribute("displayColor").IsValid():
-                 mesh_prim.GetAttribute("displayColor").Clear() # Clear single color if set
+            # Get the underlying Usd.Prim object
+            usd_prim = mesh_prim.GetPrim()
+            # Call GetAttribute on the Usd.Prim
+            display_color_attr = usd_prim.GetAttribute("displayColor")
+            if display_color_attr.IsValid():
+                 display_color_attr.Clear() # Clear single color if set
 
             # Optional: Make it slightly transparent (requires material setup usually)
             # primvarsApi = UsdGeom.PrimvarsAPI(mesh_prim)
             # primvarsApi.CreatePrimvar("displayOpacity", Sdf.ValueTypeNames.FloatArray, UsdGeom.Tokens.vertex).Set([0.8] * len(vertices_world))
 
 
-            logger.info(f"[LidarCompletionScenario] Created mesh visualization at {mesh_path} with vertex colors.")
+            logger.info(f"[LidarCompletionScenario] Created mesh visualization at {mesh_path} with {num_vertices} vertices and vertex colors.")
         except Exception as e:
             # Convex hull can fail if points are degenerate (e.g., co-planar)
             logger.error(f"[LidarCompletionScenario] Error creating mesh visualization: {e}", exc_info=True)
@@ -360,7 +387,7 @@ class LidarCompletionScenario:
 
         # Toggle mesh visibility
         mesh_prim = stage.GetPrimAtPath(mesh_path)
-        if mesh_prim.IsValid():
+        if (mesh_prim.IsValid()):
             imageable = UsdGeom.Imageable(mesh_prim)
             imageable.GetVisibilityAttr().Set(UsdGeom.Tokens.inherited if show else UsdGeom.Tokens.invisible)
 
@@ -371,52 +398,63 @@ class LidarCompletionScenario:
     def _run_inference_and_save(self):
         """
         1) Get LiDAR data
-        2) Preprocess data to match training format
+        2) Preprocess data to match training format (including normals)
         3) Run inference
         4) Save results
         5) Visualize results in the scene
         """
         # Steps 1 & 2: Get and preprocess data (moved to a separate function for clarity)
+        # This now returns the 6D tensor (normalized coords + normals) directly
         preprocessed_data = self._get_and_preprocess_lidar_data()
         if preprocessed_data is None:
+            logger.info("[LidarCompletionScenario] Preprocessing failed or returned no data.")
             return
-        full_6d, center, scale = preprocessed_data
+        full_6d, center, scale = preprocessed_data # full_6d is [N, 6] tensor
 
-        # 3. Convert to tensor and compute normals
-        coords_t = torch.from_numpy(coords).float()
-        normals_t = compute_normals_pca(coords_t, k=16)  # Same k as training
-
-        # 4. Combine coordinates and normals
-        full_6d = torch.cat([coords_t, normals_t], dim=-1)  # => [N,6]
-
+        # 3. Run inference using the preprocessed 6D tensor
         try:
             logger.info("[LidarCompletionScenario] Running data through model...")
             # Add batch dimension for model
             with torch.no_grad():
-                model_input = full_6d.unsqueeze(0)  # [1,N,6]
-                model_output = self._model(model_input).permute(0, 2, 1).contiguous()
+                # Use the full_6d tensor directly as input
+                model_input = full_6d.unsqueeze(0)  # [1, N, 6]
+                # Assuming model output needs permutation, adjust if necessary based on model definition
+                model_output = self._model(model_input).permute(0, 2, 1).contiguous() # Example: [1, C, N_out] -> [1, N_out, C]
+                logger.info(f"[LidarCompletionScenario] Model inference successful. Output shape: {model_output.shape}")
         except Exception as e:
-            logger.info(f"[LidarCompletionScenario] Model inference error: {e}")
+            # Log the full traceback for debugging
+            logger.error(f"[LidarCompletionScenario] Model inference error: {e}", exc_info=True)
             return
 
-        # Save both input and output
+        # 4. Save both input and output
         out_path = os.path.join(self._output_dir, "lidar_model_output.pt")
-        torch.save({
-            'input': full_6d,
-            'output': model_output,
-            'center': center,
-            'scale': scale
-        }, out_path)
-        logger.info(f"[LidarCompletionScenario] Saved model input/output to: {out_path}")
+        try:
+            torch.save({
+                'input': full_6d,       # Save the 6D input tensor used for inference
+                'output': model_output, # Save the model's output tensor
+                'center': center,       # Save normalization parameters
+                'scale': scale
+            }, out_path)
+            logger.info(f"[LidarCompletionScenario] Saved model input/output to: {out_path}")
+        except Exception as e:
+             logger.error(f"[LidarCompletionScenario] Error saving output file {out_path}: {e}", exc_info=True)
+             return # Don't proceed if saving failed
 
+        # Notify UI callback if registered
         if self._inference_callback:
-            self._inference_callback(out_path)
+            try:
+                self._inference_callback(out_path)
+            except Exception as e:
+                 logger.error(f"[LidarCompletionScenario] Error in inference callback: {e}", exc_info=True)
 
         # 5. Visualize the output in the scene
-        self._visualize_output_in_scene(model_output, center, scale)
+        try:
+            self._visualize_output_in_scene(model_output, center, scale)
+        except Exception as e:
+             logger.error(f"[LidarCompletionScenario] Error during visualization: {e}", exc_info=True)
 
     def _get_and_preprocess_lidar_data(self):
-        """Gets LiDAR data, preprocesses it, and returns tensors and normalization info."""
+        """Gets LiDAR data, preprocesses it (including normals), and returns tensors and normalization info."""
         if not self._annotator:
             logger.info("[LidarCompletionScenario] Annotator not available. No data to fetch.")
             return None
@@ -524,7 +562,7 @@ class UIBuilder:
     def on_timeline_event(self, event):
         """Callback for Timeline events (Play, Pause, Stop)."""
         import omni.timeline
-        if event.type == int(omni.timeline.TimelineEventType.STOP):
+        if (event.type == int(omni.timeline.TimelineEventType.STOP)):
             # Ensure visualization is removed when simulation stops
             if self._scenario:
                 self._scenario._remove_previous_visualization()
@@ -583,12 +621,18 @@ class UIBuilder:
         model_frame = CollapsableFrame("Model & Lidar Inference", collapsed=False)
         with model_frame:
             with ui.VStack(style=get_style(), spacing=5, height=0):
+                # Define default paths
+                default_model_path = r"C:\Users\techj\Desktop\isaac-sim\extsUser\gcnnpcr\checkpoints\epoch_192.pth"
+                default_output_dir = r"C:\Users\techj\Desktop\isaac-sim\extsUser\gcnnpcr\output"
+
                 with ui.HStack(spacing=5):
                     ui.Label("Model Path:", width=100)
-                    self._model_path_field = ui.StringField(height=0)
+                    # Set default value using SimpleStringModel
+                    self._model_path_field = ui.StringField(model=ui.SimpleStringModel(default_model_path), height=0)
                 with ui.HStack(spacing=5):
                     ui.Label("Output Dir:", width=100)
-                    self._output_dir_field = ui.StringField(height=0)
+                    # Set default value using SimpleStringModel
+                    self._output_dir_field = ui.StringField(model=ui.SimpleStringModel(default_output_dir), height=0)
                 ui.Button("APPLY MODEL", height=0, clicked_fn=self._on_apply_model_clicked)
 
                 # Add a toggle for visualization
@@ -635,22 +679,14 @@ class UIBuilder:
         # Pass the UI update function to the scenario
         self._scenario.set_inference_callback(self._on_inference_complete)
 
-    def _add_light_to_stage(self):
-        """Adds a default light to the stage"""
-        sphereLight = UsdLux.SphereLight.Define(get_current_stage(), Sdf.Path("/World/SphereLight"))
-        # Make the light visible in the stage tree
-        sphereLight.CreateRadiusAttr(2)
-        sphereLight.CreateIntensityAttr(100000)
-        SingleXFormPrim(str(sphereLight.GetPath())).set_world_pose([6.5, 0, 12])
-
     def _setup_scene(self):
         create_new_stage()
-        self._add_light_to_stage()
 
         loaded_objects = self._scenario.load_example_assets()
         world = World.instance()
-        for obj in loaded_objects:
-            world.scene.add(obj)
+        if loaded_objects: # Check if list is not empty
+            for obj in loaded_objects:
+                world.scene.add(obj)
         # Reset the scenario state after loading
         self._scenario.reset()
 
@@ -733,7 +769,8 @@ class UIBuilder:
             self._timeline.play()
             # Ensure the run button state reflects playing state
             if hasattr(self, "_scenario_state_btn"):
-                 self._scenario_state_btn.set_state_b() # Set to STOP state
+                 # Use set_state_b() for the second state ("STOP")
+                 self._scenario_state_btn.set_state_b()
                  self._scenario_state_btn.enabled = True
 
     def _on_show_completed_mesh_changed(self, model):
@@ -750,10 +787,12 @@ class UIBuilder:
         if not os.path.exists(pt_path):
             self._inference_label.text = f"File {pt_path} not found!"
             return
-        
+
+        temp_path = None # Initialize temp_path
         try:
             # 1) Load the saved data (input, output, center, scale, etc.)
-            data = torch.load(pt_path, map_location="cpu")
+            # ADD weights_only=True for security
+            data = torch.load(pt_path, map_location="cpu")#, weights_only=True)
             input_tensor = data.get("input", None)   # shape [N,6] (xyz + normal)
             output_tensor = data.get("output", None) # shape could vary, e.g. [B, C, N] or [B, N, C]
             center = data.get('center', np.zeros(3)) # Default to origin if not saved
@@ -832,17 +871,27 @@ class UIBuilder:
             plt.close(fig)
 
             # 4) Update the UI label and image
-            self._inference_label.text = f"Side-by-side 3D plot loaded from {pt_path}"
-            self._inference_image.source_url = temp_path
+            # Check if file exists before trying to load it in UI
+            if os.path.exists(temp_path):
+                self._inference_label.text = f"Side-by-side 3D plot loaded from {pt_path}"
+                self._inference_image.source_url = temp_path
+                logger.info(f"UI Image source set to: {temp_path}")
+            else:
+                self._inference_label.text = f"Saved plot image not found: {temp_path}"
+                logger.error(f"Temporary plot image file not found after saving: {temp_path}")
+                self._inference_image.source_url = "" # Clear image if file not found
 
         except Exception as e:
             self._inference_label.text = f"Error loading/plotting {pt_path}: {e}"
             logger.error(f"Error processing inference result {pt_path}: {e}", exc_info=True)
         finally:
             # Clean up the temporary file if it exists
-            if 'temp_path' in locals() and os.path.exists(temp_path):
-                try:
-                    os.remove(temp_path)
-                except OSError as e:
-                    logger.error(f"Error removing temporary file {temp_path}: {e}")
+            # Temporarily commenting out removal to debug UI loading issue
+            # if temp_path and os.path.exists(temp_path):
+            #     try:
+            #         # os.remove(temp_path)
+            #         logger.info(f"Temporary file {temp_path} kept for debugging.") # Log instead of removing
+            #     except OSError as e:
+            #         logger.error(f"Error removing temporary file {temp_path}: {e}")
+            pass # Keep temp file for now
 
