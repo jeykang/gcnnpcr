@@ -9,6 +9,13 @@ from glob import glob
 import random
 import torch.nn.functional as F
 from .emdloss_new import SinkhornEMDLoss
+import torch.optim.lr_scheduler as lr_scheduler
+from modules.pointnet2 import PointNet2Encoder
+from modules.dgcnn import DGCNNEncoder
+from modules.attention import CrossAttentionTransformer
+from modules.decoder_refinement import CoarseToFineDecoder
+from modules.losses import CombinedLoss
+from modules.augmentation import augment_pointcloud
 
 # ====================== Normals Utility ======================
 def local_knn_coords(coords, k=16):
@@ -446,38 +453,43 @@ class FullModelSnowflake(nn.Module):
     partial_6d => GraphEncoder => tokens => geometry-aware transformer => 
     => global_feat => SPD-based 3-stage decode => final 8192
     """
-    def __init__(self,
-                 g_hidden_dims=[64,128],
-                 g_out_dim=128,
-                 t_d_model=128,
-                 t_nhead=8,
-                 t_layers=4,
-                 coarse_num=64,
-                 bounding=True,
-                 radius=1.0,
-                 up_factors=[2,2,2,2,2,2,2]):
+    def __init__(self, 
+                 g_hidden_dims=[64,128], g_out_dim=128,
+                 t_d_model=128, t_nhead=8, t_layers=4,
+                 coarse_num=64, use_pointnet2=False, use_dgcnn=False,
+                 use_cross_attn=False, refine_stages=None, bounding=True, radius=1.0):
         super().__init__()
-        self.graph_enc = GraphEncoder(in_dim=6, hidden_dims=g_hidden_dims, out_dim=g_out_dim)
-        self.transformer = GeomMultiTokenTransformer(d_model=t_d_model, nhead=t_nhead, num_layers=t_layers)
+        # choose encoder
+        if use_pointnet2:
+            self.encoder = PointNet2Encoder(in_dim=6, out_dim=g_out_dim)
+        elif use_dgcnn:
+            self.encoder = DGCNNEncoder(in_dim=6, hidden_dims=g_hidden_dims, out_dim=g_out_dim)
+        else:
+            self.encoder = GraphEncoder(in_dim=6, hidden_dims=g_hidden_dims, out_dim=g_out_dim)
+        # choose transformer
+        if use_cross_attn:
+            self.transformer = CrossAttentionTransformer(d_model=t_d_model, nhead=t_nhead, layers=t_layers)
+        else:
+            self.transformer = GeomMultiTokenTransformer(d_model=t_d_model, nhead=t_nhead, num_layers=t_layers)
         self.bridge = nn.Linear(g_out_dim, t_d_model) if g_out_dim!=t_d_model else nn.Identity()
-        self.decoder = SPDBasedDecoder(in_feat_dim=t_d_model,
-                                       coarse_num=coarse_num,
-                                       up_factors=up_factors,
-                                       bounding=bounding,
-                                       radius=radius)
+        # base SPD decoder
+        base_dec = SPDBasedDecoder(in_feat_dim=t_d_model, coarse_num=coarse_num,
+                                   up_factors=[2]*7, bounding=bounding, radius=radius)
+        # optional refine subset
+        if refine_stages is not None:
+            self.decoder = CoarseToFineDecoder(base_dec, refine_stages)
+        else:
+            self.decoder = base_dec
 
     def forward(self, partial_6d):
-        B, N, _ = partial_6d.shape
-        # 1) encode => [B,N,g_out_dim]
-        tokens = self.graph_enc(partial_6d)
-        # 2) transform => [B,N,t_d_model], coords => partial_6d[..., :3]
-        x = self.bridge(tokens)
-        x_out = self.transformer(x, partial_6d[..., :3])
-        # 3) global => mean => [B,t_d_model,1]
-        global_feat = x_out.mean(dim=1, keepdim=True).permute(0,2,1) # => [B,t_d_model,1]
-        # 4) decode => e.g. 8192 final
-        final_pcd = self.decoder(partial_6d, global_feat)
-        return final_pcd
+        # augmentation on training
+        if self.training:
+            partial_6d = augment_pointcloud(partial_6d)
+        tokens = self.encoder(partial_6d, partial_6d[..., :3])
+        x = self.bridge(tokens.unsqueeze(1).expand(-1,partial_6d.size(1),-1))
+        x = self.transformer(x, partial_6d[..., :3])
+        global_feat = x.mean(dim=1, keepdim=True).permute(0,2,1)
+        return self.decoder(partial_6d, global_feat)
 
 # ====================== Train Loop ======================
 import torch.optim as optim
@@ -586,6 +598,8 @@ def train_s3dis_model():
     #print("Number of flops:", flops.total())
 
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
+    loss_fn = CombinedLoss(cd_w=1.0, rep_w=0.1, norm_w=0.01)
     num_epochs = 100
 
     for epoch in range(num_epochs):
@@ -624,6 +638,7 @@ def train_s3dis_model():
             epoch_loss += loss.item()
             train_iter.set_postfix({"loss": loss.item()})
 
+        scheduler.step()
         epoch_loss_avg = epoch_loss / len(train_loader)
         print(f"Epoch [{epoch+1}/{num_epochs}] - Train Loss: {epoch_loss_avg:.4f}")
 
