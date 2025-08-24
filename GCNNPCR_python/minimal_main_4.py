@@ -287,12 +287,18 @@ class S3DISDataset(Dataset):
                     train_files.append(f)
                 elif area_l in test_set:
                     test_files.append(f)
-            # Fallback: if a file's area does not match any list, include it
-            # according to the requested split.  This prevents dropping
-            # unexpected files.
-            if not train_files and not test_files:
-                train_files = all_files
-            self.files = train_files if self.split == "train" else test_files
+            # If either list is empty, fallback to a simple 80/20 split.  This
+            # ensures that the dataset always has at least one sample.  The
+            # fallback will be triggered when the specified area names do not
+            # appear in the directory structure.
+            if not train_files or not test_files:
+                split_idx = int(0.8 * len(all_files))
+                if self.split == "train":
+                    self.files = all_files[:split_idx]
+                else:
+                    self.files = all_files[split_idx:]
+            else:
+                self.files = train_files if self.split == "train" else test_files
         else:
             # 80/20 split by file order when area lists are not provided
             split_idx = int(0.8 * len(all_files))
@@ -396,7 +402,15 @@ class GraphEncoder(nn.Module):
         if self.use_attention:
             try:
                 from torch_geometric.nn import GATConv  # type: ignore
-                self.conv_cls = lambda in_c, out_c: GATConv(in_c, out_c // self.heads, heads=self.heads, concat=False)
+                # When using attention, ``concat=False`` ensures that the output
+                # dimension is ``out_c`` rather than ``out_c * heads``.  Do not
+                # divide by the number of heads here; the convolution will
+                # internally split and average across heads.  Passing
+                # ``out_c//self.heads`` (as in a previous version) reduced the
+                # feature dimension and caused a mismatch with the subsequent
+                # layers.  See https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.nn.conv.GATConv.html
+                # for details.
+                self.conv_cls = lambda in_c, out_c: GATConv(in_c, out_c, heads=self.heads, concat=False)
             except Exception:
                 # Fallback to GCNConv if GAT is unavailable
                 self.use_attention = False
@@ -750,51 +764,99 @@ def save_point_cloud_comparison(partial: torch.Tensor, completed: torch.Tensor, 
 
 
 def train_s3dis_model() -> FullModelSnowflake:
-    """Train the model on the S3DIS dataset using the patch‑based loader."""
-    # Instantiate datasets with multiple patches per room to improve context coverage
-    # Configure dataset paths and area splits here.  By default we use an
-    # explicit training/validation split on S3DIS: areas 1–5 for training and
-    # area 6 for validation.  Adjust ``train_areas`` and ``test_areas`` to use
-    # different folds.  If these lists are empty, a simple 80/20 split is
-    # applied automatically by ``S3DISDataset``.
-    train_dataset = S3DISDataset(root=r"E:\S3DIS\cvg-data.inf.ethz.ch\s3dis",
-                                mask_ratio=0.5,
-                                num_points=8192,
-                                split='train',
-                                normal_k=16,
-                                patches_per_room=4,
-                                train_areas=["Area_1", "Area_2", "Area_3", "Area_4", "Area_5"],
-                                test_areas=["Area_6"])
-    val_dataset = S3DISDataset(root=r"E:\S3DIS\cvg-data.inf.ethz.ch\s3dis",
-                              mask_ratio=0.5,
-                              num_points=8192,
-                              split='val',
-                              normal_k=16,
-                              patches_per_room=4,
-                              train_areas=["Area_1", "Area_2", "Area_3", "Area_4", "Area_5"],
-                              test_areas=["Area_6"])
-    train_loader = torch.utils.data.DataLoader(train_dataset,
-                                              batch_size=1,
-                                              shuffle=True,
-                                              num_workers=4)
-    val_loader = torch.utils.data.DataLoader(val_dataset,
-                                            batch_size=1,
-                                            shuffle=False,
-                                            num_workers=4)
+    """Train the model on the S3DIS dataset using the patch‑based loader.
+
+    This function attempts to locate the S3DIS dataset by checking a default
+    path on the ``E:`` drive and, if that does not exist, a fallback on the
+    ``F:`` drive.  Users may customise the path by setting the ``S3DIS_ROOT``
+    environment variable before running this script.  If neither path is
+    found, a ``FileNotFoundError`` is raised to signal that the dataset
+    location must be specified.
+    """
+    # Determine the dataset root path.  Prefer an environment override
+    # (useful for running on different machines) but fallback to typical
+    # Windows drive letters used in previous experiments.  Using raw string
+    # literals avoids escape issues on Windows paths.
+    env_root = os.environ.get("S3DIS_ROOT")
+    if env_root and os.path.exists(env_root):
+        dataset_root = env_root
+    else:
+        # Check typical locations on E: and F: drives.  The default path used
+        # previously was ``E:\\S3DIS\\cvg-data.inf.ethz.ch\\s3dis``.  Some
+        # installations (as indicated by the supplied directory listing)
+        # reside on the F: drive instead.  Test both and pick the first one
+        # that exists.
+        default_paths = [
+            r"E:\\S3DIS\\cvg-data.inf.ethz.ch\\s3dis",
+            r"F:\\S3DIS\\cvg-data.inf.ethz.ch\\s3dis",
+        ]
+        dataset_root = None
+        for candidate in default_paths:
+            if os.path.exists(candidate):
+                dataset_root = candidate
+                break
+    if not dataset_root:
+        raise FileNotFoundError(
+            "Could not locate the S3DIS dataset. Please set the S3DIS_ROOT "
+            "environment variable or install the dataset at E:/S3DIS or F:/S3DIS."
+        )
+
+    # Define area splits.  By default we train on Areas 1–5 and validate on Area 6.
+    train_areas = ["Area_1", "Area_2", "Area_3", "Area_4", "Area_5"]
+    test_areas = ["Area_6"]
+
+    # Instantiate datasets with multiple patches per room to improve context coverage.
+    train_dataset = S3DISDataset(
+        root=dataset_root,
+        mask_ratio=0.5,
+        num_points=8192,
+        split="train",
+        normal_k=16,
+        patches_per_room=4,
+        train_areas=train_areas,
+        test_areas=test_areas,
+    )
+    val_dataset = S3DISDataset(
+        root=dataset_root,
+        mask_ratio=0.5,
+        num_points=8192,
+        split="val",
+        normal_k=16,
+        patches_per_room=4,
+        train_areas=train_areas,
+        test_areas=test_areas,
+    )
+
+    # Build data loaders.  Use a batch size of 1 due to memory constraints.
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=1, shuffle=True, num_workers=4
+    )
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset, batch_size=1, shuffle=False, num_workers=4
+    )
+
+    # Configure device and training hyper‑parameters.
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_epochs = 100
-    model = FullModelSnowflake(g_hidden_dims=[64, 128],
-                              g_out_dim=128,
-                              t_d_model=128,
-                              t_nhead=8,
-                              t_layers=4,
-                              coarse_num=64,
-                              use_attention_encoder=True,
-                              radius=1.0).to(device)
+    model = FullModelSnowflake(
+        g_hidden_dims=[64, 128],
+        g_out_dim=128,
+        t_d_model=128,
+        t_nhead=8,
+        t_layers=4,
+        coarse_num=64,
+        use_attention_encoder=True,
+        radius=1.0,
+    ).to(device)
+
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Number of parameters: {total_params}")
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
-    scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
+    scheduler = lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=num_epochs, eta_min=1e-6
+    )
+
+    # Training loop.
     for epoch in range(num_epochs):
         model.train()
         epoch_loss = 0.0
