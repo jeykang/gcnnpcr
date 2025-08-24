@@ -1,24 +1,10 @@
 # -*- coding: utf-8 -*-
 
-"""
-This file is a modified training script for the GCNNPCR project.  The original
-repository contained a dataset loader that sampled an entire room point
-cloud down to a fixed number of points.  That approach ignored spatial
-context in larger scenes and resulted in poor completion quality.  In this
-version the ``S3DISDataset`` has been redesigned to generate multiple
-overlapping patches from each room.  Each patch contains ``num_points``
-points sampled from a local neighbourhood defined by a randomly chosen
-centre within the room's bounding box.  The number of patches per room is
-configurable via the ``patches_per_room`` parameter.  See the report for a
-discussion of the rationale behind this patch‑based design and citations to
-supporting literature.
-"""
-
 import os
 import random
 import time
 from glob import glob
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -262,8 +248,8 @@ class S3DISDataset(Dataset):
                  split: str = "train",
                  normal_k: int = 16,
                  patches_per_room: int = 1,
-                 train_areas: List[str] | None = None,
-                 test_areas: List[str] | None = None) -> None:
+                 train_areas: Optional[List[str]] = None,
+                 test_areas: Optional[List[str]] = None) -> None:
         super().__init__()
         self.root = root
         self.mask_ratio = mask_ratio
@@ -395,7 +381,7 @@ class GraphEncoder(nn.Module):
 
     def __init__(self,
                  in_dim: int = 6,
-                 hidden_dims: List[int] | None = None,
+                 hidden_dims: Optional[List[int]] = None,
                  out_dim: int = 128,
                  k: int = 16,
                  use_attention: bool = False,
@@ -672,7 +658,7 @@ class FullModelSnowflake(nn.Module):
     """
 
     def __init__(self,
-                 g_hidden_dims: List[int] | None = None,
+                 g_hidden_dims: Optional[List[int]] = None,
                  g_out_dim: int = 128,
                  t_d_model: int = 128,
                  t_nhead: int = 8,
@@ -771,7 +757,7 @@ def train_s3dis_model() -> FullModelSnowflake:
     # area 6 for validation.  Adjust ``train_areas`` and ``test_areas`` to use
     # different folds.  If these lists are empty, a simple 80/20 split is
     # applied automatically by ``S3DISDataset``.
-    train_dataset = S3DISDataset(root=r"F:\S3DIS\cvg-data.inf.ethz.ch\s3dis",
+    train_dataset = S3DISDataset(root=r"E:\S3DIS\cvg-data.inf.ethz.ch\s3dis",
                                 mask_ratio=0.5,
                                 num_points=8192,
                                 split='train',
@@ -779,7 +765,7 @@ def train_s3dis_model() -> FullModelSnowflake:
                                 patches_per_room=4,
                                 train_areas=["Area_1", "Area_2", "Area_3", "Area_4", "Area_5"],
                                 test_areas=["Area_6"])
-    val_dataset = S3DISDataset(root=r"F:\S3DIS\cvg-data.inf.ethz.ch\s3dis",
+    val_dataset = S3DISDataset(root=r"E:\S3DIS\cvg-data.inf.ethz.ch\s3dis",
                               mask_ratio=0.5,
                               num_points=8192,
                               split='val',
