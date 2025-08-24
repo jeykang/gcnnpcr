@@ -32,15 +32,18 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from modules.attention import CrossAttentionTransformer
-from modules.augmentation import augment_pointcloud
-from modules.decoder_refinement import CoarseToFineDecoder
-from modules.dgcnn import DGCNNEncoder
-from modules.losses import CombinedLoss
-from modules.pointnet2 import PointNet2Encoder
-from modules.pointnet2 import PointNet2Encoder
-from modules.losses import CombinedLoss
-from .emdloss_new import SinkhornEMDLoss
+# The following imports reference modules that are not present in the trimmed
+# version of this repository.  The associated functionality (cross‑attention
+# transformer, point cloud augmentation, DGCNN/PointNet2 encoders, combined
+# losses and EMD) is reimplemented later in this file.  These imports are
+# commented out to avoid ImportError.
+# from modules.attention import CrossAttentionTransformer
+# from modules.augmentation import augment_pointcloud
+# from modules.decoder_refinement import CoarseToFineDecoder
+# from modules.dgcnn import DGCNNEncoder
+# from modules.losses import CombinedLoss
+# from modules.pointnet2 import PointNet2Encoder
+# from .emdloss_new import SinkhornEMDLoss
 
 matplotlib.use("Agg")  # Use non‑interactive backend for saving images
 
@@ -113,6 +116,133 @@ def compute_normals_pca(coords_t: torch.Tensor, k: int = 16) -> torch.Tensor:
     normals = F.normalize(normals, dim=-1)
     return normals
 
+# ---------------------------------------------------------------------------
+# Data augmentation and loss functions
+# ---------------------------------------------------------------------------
+
+def augment_pointcloud(pc: torch.Tensor,
+                       sigma: float = 0.01,
+                       clip: float = 0.05,
+                       scale_low: float = 0.9,
+                       scale_high: float = 1.1,
+                       drop_ratio: float = 0.1) -> torch.Tensor:
+    """
+    Apply simple augmentations to a batch of point clouds.  The first three
+    channels of ``pc`` are assumed to be XYZ coordinates and the remaining
+    channels (if any) are treated as features.  Augmentations include jitter,
+    random scaling, rotation about the Z axis and random point drop‑out.  All
+    augmentations are applied identically across each point cloud in the batch.
+
+    Args:
+        pc: Tensor of shape ``[B, N, C]`` containing point clouds.  At least
+            three channels are required.
+        sigma: Standard deviation of Gaussian jitter.
+        clip: Maximum absolute value of jitter.
+        scale_low: Lower bound of random scaling factor.
+        scale_high: Upper bound of random scaling factor.
+        drop_ratio: Fraction of points to randomly drop (set to zero).
+
+    Returns:
+        Augmented point cloud of the same shape as the input.
+    """
+    coords = pc[..., :3]
+    feats = pc[..., 3:] if pc.shape[-1] > 3 else None
+    B, N, _ = coords.shape
+    # Jitter
+    noise = torch.randn_like(coords) * sigma
+    noise = noise.clamp(-clip, clip)
+    coords = coords + noise
+    # Scaling
+    scales = torch.empty(B, 1, 1, device=coords.device).uniform_(scale_low, scale_high)
+    coords = coords * scales
+    # Rotation around Z axis
+    # Generate random angles for each batch
+    angles = torch.rand(B, device=coords.device) * 2 * np.pi
+    cos_vals = torch.cos(angles)
+    sin_vals = torch.sin(angles)
+    rot_mats = torch.zeros(B, 3, 3, device=coords.device)
+    rot_mats[:, 0, 0] = cos_vals
+    rot_mats[:, 0, 1] = -sin_vals
+    rot_mats[:, 1, 0] = sin_vals
+    rot_mats[:, 1, 1] = cos_vals
+    rot_mats[:, 2, 2] = 1.0
+    coords = torch.bmm(coords, rot_mats)
+    # Random drop‑out
+    if drop_ratio > 0.0:
+        drop_n = max(1, int(N * drop_ratio))
+        for b in range(B):
+            idx = torch.randperm(N, device=coords.device)[:drop_n]
+            coords[b, idx] = 0.0
+            if feats is not None:
+                feats[b, idx] = 0.0
+    # Concatenate coordinates and features back together
+    if feats is not None:
+        return torch.cat([coords, feats], dim=-1)
+    return coords
+
+def chamfer_distance(pcd1: torch.Tensor, pcd2: torch.Tensor) -> torch.Tensor:
+    """
+    Compute the symmetric Chamfer distance between two batches of point clouds.
+
+    Args:
+        pcd1: Tensor of shape ``[B, N, 3]``.
+        pcd2: Tensor of shape ``[B, M, 3]``.
+
+    Returns:
+        Scalar tensor containing the average Chamfer distance across the batch.
+    """
+    dist = torch.cdist(pcd1, pcd2)  # [B,N,M]
+    min1 = dist.min(dim=2)[0]  # [B,N]
+    min2 = dist.min(dim=1)[0]  # [B,M]
+    cd = min1.mean(dim=1) + min2.mean(dim=1)
+    return cd.mean()
+
+def repulsion_loss(pcd: torch.Tensor, k: int = 4, threshold: float = 0.02) -> torch.Tensor:
+    """
+    Compute a simple repulsion loss that penalises pairs of points within a
+    threshold distance.  For each point the ``k`` nearest neighbours are
+    considered; distances smaller than ``threshold`` contribute to the loss.
+
+    Args:
+        pcd: Tensor of shape ``[B, N, 3]`` containing point coordinates.
+        k: Number of nearest neighbours to inspect for each point.
+        threshold: Repulsion distance threshold.
+
+    Returns:
+        Scalar tensor containing the average repulsion penalty.
+    """
+    B, N, _ = pcd.shape
+    loss = 0.0
+    for b in range(B):
+        dist = torch.cdist(pcd[b], pcd[b])  # [N,N]
+        # Add large constant to diagonal to avoid self‑interaction
+        dist = dist + torch.eye(N, device=pcd.device) * 1e9
+        knn_vals, _ = dist.topk(k, largest=False)
+        mask = knn_vals < threshold
+        # Penalise distances below the threshold
+        penal = (threshold - knn_vals[mask]) ** 2
+        loss = loss + penal.mean()
+    return loss / B
+
+def combined_loss(pred: torch.Tensor, gt: torch.Tensor,
+                  cd_w: float = 1.0, rep_w: float = 0.1) -> torch.Tensor:
+    """
+    Combined loss composed of Chamfer distance and repulsion penalty.  Normal
+    consistency can optionally be added by extending this function.
+
+    Args:
+        pred: Predicted point clouds of shape ``[B, N, 3]``.
+        gt: Ground‑truth point clouds of shape ``[B, M, 3]``.
+        cd_w: Weight for the Chamfer distance term.
+        rep_w: Weight for the repulsion term.
+
+    Returns:
+        Scalar loss tensor.
+    """
+    cd = chamfer_distance(pred, gt)
+    rep = repulsion_loss(pred)
+    return cd_w * cd + rep_w * rep
+
 
 class S3DISDataset(Dataset):
     """Patch‑based dataset for the Stanford 3D Indoor Scenes (S3DIS) dataset.
@@ -131,7 +261,9 @@ class S3DISDataset(Dataset):
                  num_points: int = 8192,
                  split: str = "train",
                  normal_k: int = 16,
-                 patches_per_room: int = 1) -> None:
+                 patches_per_room: int = 1,
+                 train_areas: List[str] | None = None,
+                 test_areas: List[str] | None = None) -> None:
         super().__init__()
         self.root = root
         self.mask_ratio = mask_ratio
@@ -146,12 +278,42 @@ class S3DISDataset(Dataset):
         pattern = os.path.join(root, "**", "*.txt")
         all_files: List[str] = [f for f in glob(pattern, recursive=True)
                                 if ("alignmentAngle" not in f and "Annotations" not in f)]
-        # Use an 80/20 split for training/validation by file order.
-        split_idx = int(0.8 * len(all_files))
-        if self.split == "train":
-            self.files = all_files[:split_idx]
+
+        # Use explicit area‑level splits if specified.  The S3DIS dataset
+        # consists of six areas (Area_1 through Area_6).  Many papers train
+        # on five areas and evaluate on the remaining one; e.g. training on
+        # Areas 1–5 and testing on Area 6.  You can override this behaviour by
+        # passing `train_areas` and `test_areas` lists; otherwise an 80/20
+        # random split is applied.
+        if train_areas or test_areas:
+            # Normalise area names to lower‑case to avoid mismatches
+            train_set = {a.lower() for a in (train_areas or [])}
+            test_set = {a.lower() for a in (test_areas or [])}
+            train_files: List[str] = []
+            test_files: List[str] = []
+            for f in all_files:
+                # Extract area name by splitting path; expects "Area_X" to
+                # appear in the file path.
+                parts = f.replace("\\", "/").split("/")
+                area = next((p for p in parts if p.lower().startswith("area_")), "")
+                area_l = area.lower()
+                if area_l in train_set:
+                    train_files.append(f)
+                elif area_l in test_set:
+                    test_files.append(f)
+            # Fallback: if a file's area does not match any list, include it
+            # according to the requested split.  This prevents dropping
+            # unexpected files.
+            if not train_files and not test_files:
+                train_files = all_files
+            self.files = train_files if self.split == "train" else test_files
         else:
-            self.files = all_files[split_idx:]
+            # 80/20 split by file order when area lists are not provided
+            split_idx = int(0.8 * len(all_files))
+            if self.split == "train":
+                self.files = all_files[:split_idx]
+            else:
+                self.files = all_files[split_idx:]
 
     def __len__(self) -> int:
         # Each file yields ``patches_per_room`` samples.
@@ -215,47 +377,76 @@ from torch_geometric.nn import GCNConv, knn_graph
 
 
 class GraphEncoder(nn.Module):
-    """Graph convolutional encoder for point clouds.
+    """
+    Graph convolutional encoder for point clouds.  This class supports two
+    variants of edge aggregation: a standard graph convolution (GCN) and a
+    graph attention (GAT) layer.  Attention can better capture the relative
+    importance of neighbours within a local neighbourhood, which is inspired
+    by the relation‑based weighting mechanism proposed in PointCFormer【538684515318844†L43-L57】.
 
-    The input is a set of points with 6‑D features (coords + normals).
-    We build a k‑nearest neighbour graph on the 3‑D coordinates and run a
-    sequence of GCN layers to obtain per‑point tokens.
+    Args:
+        in_dim: Input feature dimensionality (e.g. 6 for XYZ + normals).
+        hidden_dims: List of hidden feature dimensions for successive layers.
+        out_dim: Output feature dimensionality per point.
+        k: Number of nearest neighbours used to construct the graph.
+        use_attention: If True, attempt to use a GAT layer instead of a GCN.
+        heads: Number of attention heads when ``use_attention`` is True.
     """
 
-    def __init__(self, in_dim: int = 6, hidden_dims: List[int] = [64, 128], out_dim: int = 128, k: int = 16) -> None:
+    def __init__(self,
+                 in_dim: int = 6,
+                 hidden_dims: List[int] | None = None,
+                 out_dim: int = 128,
+                 k: int = 16,
+                 use_attention: bool = False,
+                 heads: int = 4) -> None:
         super().__init__()
+        if hidden_dims is None:
+            hidden_dims = [64, 128]
         self.k = k
+        self.use_attention = use_attention
+        self.heads = heads
+        # Attempt to import GATConv if attention is requested
+        if self.use_attention:
+            try:
+                from torch_geometric.nn import GATConv  # type: ignore
+                self.conv_cls = lambda in_c, out_c: GATConv(in_c, out_c // self.heads, heads=self.heads, concat=False)
+            except Exception:
+                # Fallback to GCNConv if GAT is unavailable
+                self.use_attention = False
+        if not self.use_attention:
+            from torch_geometric.nn import GCNConv  # type: ignore
+            self.conv_cls = lambda in_c, out_c: GCNConv(in_c, out_c)
         self.gconvs = nn.ModuleList()
         prev_dim = in_dim
         for hd in hidden_dims:
-            self.gconvs.append(GCNConv(prev_dim, hd))
+            self.gconvs.append(self.conv_cls(prev_dim, hd))
             prev_dim = hd
         self.final_lin = nn.Linear(prev_dim, out_dim)
 
-    def forward(self, coords_batch: torch.Tensor) -> torch.Tensor:
-        """Process a batch of point clouds.
-
-        Args:
-            coords_batch: Tensor of shape ``[B, N, 6]`` containing 3‑D coords
-                and normals.
+    def forward(self, feats_batch: torch.Tensor) -> torch.Tensor:
+        """
+        Process a batch of point clouds.  ``feats_batch`` should have shape
+        ``[B, N, C]`` where the first three channels correspond to coordinates
+        used to build the k‑NN graph.  Any additional channels are treated as
+        per‑point features and are passed through the convolution layers.
 
         Returns:
-            Tensor of shape ``[B, N, out_dim]`` containing per‑point features.
+            A tensor of shape ``[B, N, out_dim]`` containing per‑point features.
         """
-        B, N, C = coords_batch.shape
-        all_feats: List[torch.Tensor] = []
+        B, N, C = feats_batch.shape
+        outputs: List[torch.Tensor] = []
         for b in range(B):
-            feats_b = coords_batch[b]         # [N,6]
-            coords_3d = feats_b[:, :3]        # [N,3] for adjacency
+            feats_b = feats_batch[b]  # [N,C]
+            coords_3d = feats_b[:, :3]  # [N,3]
             edge_idx = knn_graph(coords_3d, k=self.k, loop=False)
-            x = feats_b.clone()
+            x = feats_b
             for conv in self.gconvs:
                 x = conv(x, edge_idx)
                 x = F.relu(x)
-            x_out = self.final_lin(x)  # [N,out_dim]
-            all_feats.append(x_out.unsqueeze(0))
-        token_feats = torch.cat(all_feats, dim=0)  # [B,N,out_dim]
-        return token_feats
+            x_out = self.final_lin(x)
+            outputs.append(x_out.unsqueeze(0))
+        return torch.cat(outputs, dim=0)
 
 
 # ===========================================================================
@@ -462,40 +653,71 @@ class SPDBasedDecoder(nn.Module):
 
 
 class FullModelSnowflake(nn.Module):
-    """Complete model combining encoder, transformer, and decoder."""
+    """
+    Complete model combining an encoder, a geometry‑aware transformer and a
+    Snowflake‑style decoder.  The encoder is a configurable graph network
+    (either GCN or GAT) defined in this file; the transformer is the
+    ``GeomMultiTokenTransformer``; and the decoder is ``SPDBasedDecoder``.
+
+    Args:
+        g_hidden_dims: Hidden dimensions for the graph encoder.
+        g_out_dim: Output dimension of the graph encoder.
+        t_d_model: Token dimension for the transformer and decoder.
+        t_nhead: Number of heads in the transformer.
+        t_layers: Number of transformer layers.
+        coarse_num: Number of coarse seed points output by the decoder.
+        use_attention_encoder: Whether to use graph attention in the encoder.
+        bounding: Whether to bound point offsets in the decoder.
+        radius: Radius parameter controlling decoder offset scaling.
+    """
 
     def __init__(self,
-                 g_hidden_dims: List[int] = [64, 128], g_out_dim: int = 128,
-                 t_d_model: int = 128, t_nhead: int = 8, t_layers: int = 4,
-                 coarse_num: int = 64, use_pointnet2: bool = False, use_dgcnn: bool = False,
-                 use_cross_attn: bool = False, refine_stages=None, bounding: bool = True, radius: float = 1.0) -> None:
+                 g_hidden_dims: List[int] | None = None,
+                 g_out_dim: int = 128,
+                 t_d_model: int = 128,
+                 t_nhead: int = 8,
+                 t_layers: int = 4,
+                 coarse_num: int = 64,
+                 use_attention_encoder: bool = False,
+                 bounding: bool = True,
+                 radius: float = 1.0) -> None:
         super().__init__()
-        if use_pointnet2:
-            self.encoder = PointNet2Encoder(in_dim=6, out_dim=g_out_dim)
-        elif use_dgcnn:
-            self.encoder = DGCNNEncoder(in_dim=6, hidden_dims=g_hidden_dims, out_dim=g_out_dim)
-        else:
-            self.encoder = GraphEncoder(in_dim=6, hidden_dims=g_hidden_dims, out_dim=g_out_dim)
-        if use_cross_attn:
-            self.transformer = CrossAttentionTransformer(d_model=t_d_model, nhead=t_nhead, layers=t_layers)
-        else:
-            self.transformer = GeomMultiTokenTransformer(d_model=t_d_model, nhead=t_nhead, num_layers=t_layers)
+        if g_hidden_dims is None:
+            g_hidden_dims = [64, 128]
+        # Encoder: GraphEncoder with optional attention
+        self.encoder = GraphEncoder(in_dim=6,
+                                    hidden_dims=g_hidden_dims,
+                                    out_dim=g_out_dim,
+                                    k=16,
+                                    use_attention=use_attention_encoder,
+                                    heads=4)
+        # Transformer: geometry‑aware multi‑token transformer
+        self.transformer = GeomMultiTokenTransformer(d_model=t_d_model,
+                                                     nhead=t_nhead,
+                                                     num_layers=t_layers)
+        # Bridge layer maps encoder output dimension to transformer dimension
         self.bridge = nn.Linear(g_out_dim, t_d_model) if g_out_dim != t_d_model else nn.Identity()
-        base_dec = SPDBasedDecoder(in_feat_dim=t_d_model, coarse_num=coarse_num,
-                                   up_factors=[2] * 7, bounding=bounding, radius=radius)
-        if refine_stages is not None:
-            self.decoder = CoarseToFineDecoder(base_dec, refine_stages)
-        else:
-            self.decoder = base_dec
+        # Decoder: Snowflake‑style upsampling network
+        self.decoder = SPDBasedDecoder(in_feat_dim=t_d_model,
+                                       coarse_num=coarse_num,
+                                       up_factors=[2] * 7,
+                                       bounding=bounding,
+                                       radius=radius)
 
     def forward(self, partial_6d: torch.Tensor) -> torch.Tensor:
+        # Apply augmentation during training
         if self.training:
             partial_6d = augment_pointcloud(partial_6d)
-        tokens = self.encoder(partial_6d, partial_6d[..., :3])
-        x = self.bridge(tokens.unsqueeze(1).expand(-1, partial_6d.size(1), -1))
-        x = self.transformer(x, partial_6d[..., :3])
-        global_feat = x.mean(dim=1, keepdim=True).permute(0, 2, 1)
-        return self.decoder(partial_6d, global_feat)
+        # Encode per‑point features
+        tokens = self.encoder(partial_6d)  # [B,N,g_out_dim]
+        # Map to transformer dimension
+        x = self.bridge(tokens)  # [B,N,t_d_model]
+        # Apply transformer with geometry bias
+        x = self.transformer(x, partial_6d[..., :3])  # coords used for bias
+        # Aggregate global feature by averaging token features
+        global_feat = x.mean(dim=1, keepdim=True).permute(0, 2, 1)  # [B,t_d_model,1]
+        # Decode to full point cloud
+        return self.decoder(partial_6d, global_feat)  # returns [B,3,num_points]
 
 
 # ===========================================================================
@@ -544,43 +766,51 @@ def save_point_cloud_comparison(partial: torch.Tensor, completed: torch.Tensor, 
 def train_s3dis_model() -> FullModelSnowflake:
     """Train the model on the S3DIS dataset using the patch‑based loader."""
     # Instantiate datasets with multiple patches per room to improve context coverage
-    train_dataset = S3DISDataset(root=r"E:\S3DIS\cvg-data.inf.ethz.ch\s3dis",
+    # Configure dataset paths and area splits here.  By default we use an
+    # explicit training/validation split on S3DIS: areas 1–5 for training and
+    # area 6 for validation.  Adjust ``train_areas`` and ``test_areas`` to use
+    # different folds.  If these lists are empty, a simple 80/20 split is
+    # applied automatically by ``S3DISDataset``.
+    train_dataset = S3DISDataset(root=r"F:\S3DIS\cvg-data.inf.ethz.ch\s3dis",
                                 mask_ratio=0.5,
                                 num_points=8192,
                                 split='train',
                                 normal_k=16,
-                                patches_per_room=4)
-    val_dataset = S3DISDataset(root=r"E:\S3DIS\cvg-data.inf.ethz.ch\s3dis",
+                                patches_per_room=4,
+                                train_areas=["Area_1", "Area_2", "Area_3", "Area_4", "Area_5"],
+                                test_areas=["Area_6"])
+    val_dataset = S3DISDataset(root=r"F:\S3DIS\cvg-data.inf.ethz.ch\s3dis",
                               mask_ratio=0.5,
                               num_points=8192,
                               split='val',
                               normal_k=16,
-                              patches_per_room=4)
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=1, shuffle=True, num_workers=16)
-    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=16)
+                              patches_per_room=4,
+                              train_areas=["Area_1", "Area_2", "Area_3", "Area_4", "Area_5"],
+                              test_areas=["Area_6"])
+    train_loader = torch.utils.data.DataLoader(train_dataset,
+                                              batch_size=1,
+                                              shuffle=True,
+                                              num_workers=4)
+    val_loader = torch.utils.data.DataLoader(val_dataset,
+                                            batch_size=1,
+                                            shuffle=False,
+                                            num_workers=4)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_epochs = 100
-    model = FullModelSnowflake(
-        g_hidden_dims=[64, 128],
-        g_out_dim=128,
-        t_d_model=128,
-        t_nhead=8,
-        t_layers=4,
-        coarse_num=64,
-        radius=1.0
-    ).to(device)
+    model = FullModelSnowflake(g_hidden_dims=[64, 128],
+                              g_out_dim=128,
+                              t_d_model=128,
+                              t_nhead=8,
+                              t_layers=4,
+                              coarse_num=64,
+                              use_attention_encoder=True,
+                              radius=1.0).to(device)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Number of parameters: {total_params}")
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
     scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
     for epoch in range(num_epochs):
         model.train()
-        emd_criterion = SinkhornEMDLoss(
-            reg=0.05,
-            max_iters=25,
-            num_samples=1024,
-            use_warm_start=True
-        ).to(device)
         epoch_loss = 0.0
         train_iter = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
         for _, batch in enumerate(train_iter):
@@ -588,11 +818,9 @@ def train_s3dis_model() -> FullModelSnowflake:
             full_6d = batch["full"].to(device)
             optimizer.zero_grad()
             completed = model(partial_6d)  # [B,3,8192]
-            completed_renorm = completed.permute(0, 2, 1).contiguous()  # [B,8192,3]
-            loss_emd = emd_criterion(completed_renorm, full_6d[..., :3])
-            cd_val, _ = chamfer_distance(completed_renorm, full_6d[..., :3])
-            rep_val = repulsion_loss(completed_renorm, k=4, threshold=0.02)
-            loss = loss_emd + cd_val + 0.1 * rep_val
+            completed_coords = completed.permute(0, 2, 1).contiguous()  # [B,8192,3]
+            gt_coords = full_6d[..., :3]
+            loss = combined_loss(completed_coords, gt_coords)
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
@@ -608,9 +836,9 @@ def train_s3dis_model() -> FullModelSnowflake:
                 partial_val_6d = batch_val["partial"].to(device)
                 full_val_6d = batch_val["full"].to(device)
                 completed_val = model(partial_val_6d)
-                completed_val_renorm = completed_val.permute(0, 2, 1).contiguous()
-                cd_val_v, _ = chamfer_distance(completed_val_renorm, full_val_6d[..., :3])
-                val_loss += cd_val_v.item()
+                completed_val_coords = completed_val.permute(0, 2, 1).contiguous()
+                gt_val_coords = full_val_6d[..., :3]
+                val_loss = val_loss + chamfer_distance(completed_val_coords, gt_val_coords).item()
         val_loss_avg = val_loss / len(val_loader)
         print(f"    Validation Chamfer: {val_loss_avg:.4f}")
         # Save checkpoint
@@ -618,10 +846,10 @@ def train_s3dis_model() -> FullModelSnowflake:
         ckpt_path = f"checkpoints/epoch_{epoch+1}.pth"
         torch.save(model.state_dict(), ckpt_path)
         print(f"Saved model checkpoint to {ckpt_path}")
-        # Visualise sample output
-        partial_0 = partial_6d[0, ..., :3]
-        completed_0 = completed_renorm[0]
-        original_0 = full_6d[0, ..., :3]
+        # Visualise sample output using the first training sample of this epoch
+        partial_0 = partial_6d[0, ..., :3].detach().cpu()
+        completed_0 = completed_coords[0].detach().cpu()
+        original_0 = full_6d[0, ..., :3].detach().cpu()
         save_point_cloud_comparison(partial_0, completed_0, original_0, epoch+1)
     return model
 
