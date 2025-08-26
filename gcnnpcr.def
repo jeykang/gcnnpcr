@@ -1,0 +1,77 @@
+Bootstrap: docker
+From: pytorch/pytorch:1.13.0-cuda11.6-cudnn8-runtime
+
+%post
+    # Update package lists and install system dependencies
+    apt-get update && apt-get install -y \
+        wget \
+        curl \
+        git \
+        vim \
+        build-essential \
+        libgl1-mesa-glx \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        libxrender-dev \
+        libgomp1 \
+        libglu1-mesa \
+        libxi6 \
+        libxrandr2 \
+        libxinerama1 \
+        libxcursor1 \
+        && rm -rf /var/lib/apt/lists/*
+
+    # Upgrade pip
+    python -m pip install --upgrade pip
+
+    # Install PyTorch Geometric and dependencies
+    # Note: Adjust versions based on PyTorch version
+    pip install torch-scatter torch-sparse torch-cluster torch-spline-conv torch-geometric -f https://data.pyg.org/whl/torch-1.13.0+cu116.html
+
+    # Install core dependencies
+    pip install \
+        numpy \
+        scipy \
+        scikit-learn \
+        matplotlib \
+        tqdm \
+        tensorboard \
+        Pillow
+
+    # Install Open3D for point cloud processing
+    pip install open3d
+
+    # Install additional dependencies from the project
+    pip install \
+        einops \
+        lmdb \
+        pyyaml \
+        wandb
+
+    # Create directories for mounting
+    mkdir -p /workspace /data /checkpoints
+
+%environment
+    # Set Python path
+    export PYTHONPATH=/workspace:$PYTHONPATH
+    
+    # CUDA settings
+    export CUDA_HOME=/usr/local/cuda
+    export PATH=$CUDA_HOME/bin:$PATH
+    export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+    
+    # OpenMP settings for better CPU parallelism
+    export OMP_NUM_THREADS=4
+
+%runscript
+    echo "GCNN Point Cloud Reconstruction Container"
+    echo "PyTorch version: $(python -c 'import torch; print(torch.__version__)')"
+    echo "CUDA available: $(python -c 'import torch; print(torch.cuda.is_available())')"
+    echo "Number of GPUs: $(python -c 'import torch; print(torch.cuda.device_count())')"
+    exec "$@"
+
+%labels
+    Author GCNNPCR Team
+    Version 1.0
+    Description Container for GCNN Point Cloud Reconstruction training with PyTorch DDP support
