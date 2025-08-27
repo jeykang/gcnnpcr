@@ -39,12 +39,14 @@ def setup_distributed():
     """Initialize distributed training environment"""
     
     # Check if we're in a distributed environment
-    if 'WORLD_SIZE' in os.environ:
-        world_size = int(os.environ['WORLD_SIZE'])
+    # torchrun sets these environment variables
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         rank = int(os.environ['RANK'])
-        local_rank = int(os.environ['LOCAL_RANK'])
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        world_size = int(os.environ['WORLD_SIZE'])
+        print(f"Detected torchrun environment: rank={rank}, local_rank={local_rank}, world_size={world_size}")
     elif 'SLURM_PROCID' in os.environ:
-        # SLURM environment
+        # SLURM environment (when not using torchrun)
         world_size = int(os.environ['SLURM_NTASKS'])
         rank = int(os.environ['SLURM_PROCID'])
         local_rank = int(os.environ['SLURM_LOCALID'])
@@ -53,6 +55,13 @@ def setup_distributed():
         os.environ['MASTER_ADDR'] = os.environ.get('MASTER_ADDR', 
                                                     os.environ.get('SLURM_SUBMIT_HOST', '127.0.0.1'))
         os.environ['MASTER_PORT'] = os.environ.get('MASTER_PORT', '29500')
+        
+        # Set environment variables for torch.distributed
+        os.environ['RANK'] = str(rank)
+        os.environ['LOCAL_RANK'] = str(local_rank)
+        os.environ['WORLD_SIZE'] = str(world_size)
+        
+        print(f"Detected SLURM environment: rank={rank}, local_rank={local_rank}, world_size={world_size}")
     else:
         # Single GPU mode
         world_size = 1
@@ -60,11 +69,43 @@ def setup_distributed():
         local_rank = 0
         os.environ['MASTER_ADDR'] = '127.0.0.1'
         os.environ['MASTER_PORT'] = '29500'
+        os.environ['RANK'] = '0'
+        os.environ['LOCAL_RANK'] = '0'
+        os.environ['WORLD_SIZE'] = '1'
+        print(f"Single GPU mode: rank={rank}, local_rank={local_rank}, world_size={world_size}")
     
     # Initialize process group
     if world_size > 1:
-        dist.init_process_group(backend='nccl', world_size=world_size, rank=rank)
-        torch.cuda.set_device(local_rank)
+        # Initialize the process group
+        # torchrun will have already set up the rendezvous backend
+        if 'TORCHELASTIC_RESTART_COUNT' in os.environ:
+            # torchrun/torch.distributed.launch is being used
+            dist.init_process_group(backend='nccl')
+        else:
+            # Manual initialization
+            dist.init_process_group(backend='nccl', 
+                                  init_method='env://',
+                                  world_size=world_size, 
+                                  rank=rank)
+    
+    # Handle CUDA device assignment properly
+    if torch.cuda.is_available():
+        num_gpus = torch.cuda.device_count()
+        if num_gpus > 0:
+            # Use local_rank to select device
+            # When CUDA_VISIBLE_DEVICES is set, devices are already filtered
+            device_id = local_rank % num_gpus
+            torch.cuda.set_device(device_id)
+            
+            # Get actual device name for logging
+            device_name = torch.cuda.get_device_name(device_id)
+            print(f"[Rank {rank}] Using CUDA device {device_id}: {device_name}")
+            print(f"[Rank {rank}] CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')}")
+        else:
+            print(f"[Rank {rank}] WARNING: No CUDA devices available!")
+            raise RuntimeError("No CUDA devices available")
+    else:
+        print(f"[Rank {rank}] WARNING: CUDA not available, using CPU")
     
     return rank, local_rank, world_size
 
@@ -214,17 +255,18 @@ def main(args):
     
     # Set device
     if torch.cuda.is_available():
-        device = torch.device(f'cuda:{local_rank}')
-        torch.cuda.set_device(local_rank)
+        device = torch.device(f'cuda:{local_rank % torch.cuda.device_count()}')
+        torch.cuda.set_device(device)
     else:
         device = torch.device('cpu')
+        print(f"[Rank {rank}] WARNING: Running on CPU!")
     
     # Set random seeds for reproducibility
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    random.seed(args.seed)
+    torch.manual_seed(args.seed + rank)  # Different seed per rank
+    np.random.seed(args.seed + rank)
+    random.seed(args.seed + rank)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
+        torch.cuda.manual_seed_all(args.seed + rank)
     
     # Print configuration (only from main process)
     if is_main_process(rank):

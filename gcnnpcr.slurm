@@ -81,72 +81,41 @@ if [ -f "${CHECKPOINT_DIR}/latest_checkpoint.pth" ]; then
     RESUME_ARGS="--resume --checkpoint_path ${CHECKPOINT_DIR}/latest_checkpoint.pth"
 fi
 
-# Function to launch training on each GPU
-launch_training() {
-    local RANK=$1
-    local LOCAL_RANK=$2
+# Launch distributed training
+if [ ${SLURM_NNODES} -eq 1 ]; then
+    # Single-node multi-GPU training
+    echo "Starting single-node multi-GPU training with ${SLURM_NTASKS} GPUs..."
     
-    export RANK=$RANK
-    export LOCAL_RANK=$LOCAL_RANK
-    export CUDA_VISIBLE_DEVICES=$LOCAL_RANK
-    
+    # Use torchrun for single-node multi-GPU (more robust)
     singularity exec --nv \
         --bind "${PROJECT_ROOT}:/workspace" \
         --bind "${DATASET_ROOT}:/data" \
         --bind "${CHECKPOINT_DIR}:/checkpoints" \
         --bind "${VIS_DIR}:/visuals" \
         "$SINGULARITY_IMAGE" \
-        python /workspace/GCNNPCR_python/train_distributed.py \
-            --dataset_root /data \
-            --checkpoint_dir /checkpoints \
-            --vis_dir /visuals \
-            --batch_size $BATCH_SIZE \
-            --num_epochs $NUM_EPOCHS \
-            --learning_rate $LEARNING_RATE \
-            --num_workers $NUM_WORKERS \
-            --train_areas "Area_1,Area_2,Area_3,Area_4,Area_5" \
-            --test_areas "Area_6" \
-            --mask_ratio 0.5 \
-            --num_points 8192 \
-            --patches_per_room 4 \
-            --vis_interval 10 \
-            --seed 42 \
-            $ATTENTION_ARG \
-            $RESUME_ARGS \
-        2>&1 | tee "${LOG_DIR}/rank_${RANK}.log"
-}
-
-# Launch distributed training
-if [ ${SLURM_NNODES} -eq 1 ]; then
-    # Single-node multi-GPU training
-    echo "Starting single-node multi-GPU training with ${SLURM_NTASKS} GPUs..."
-    
-    for i in $(seq 0 $((SLURM_NTASKS - 1))); do
-        launch_training $i $i &
-        PIDS[$i]=$!
-        echo "Launched Rank $i with PID ${PIDS[$i]}"
-        sleep 2
-    done
-    
-    # Wait for all processes to complete
-    FAILED=0
-    for i in $(seq 0 $((SLURM_NTASKS - 1))); do
-        wait ${PIDS[$i]}
-        EXIT_CODE=$?
-        if [ $EXIT_CODE -ne 0 ]; then
-            echo "ERROR: Rank $i failed with exit code $EXIT_CODE"
-            FAILED=$((FAILED + 1))
-        else
-            echo "Rank $i completed successfully"
-        fi
-    done
-    
-    if [ $FAILED -eq 0 ]; then
-        echo "Training completed successfully!"
-    else
-        echo "Training failed on $FAILED rank(s)"
-        exit 1
-    fi
+        torchrun \
+            --standalone \
+            --nnodes=1 \
+            --nproc_per_node=${SLURM_NTASKS} \
+            --master_addr=${MASTER_ADDR} \
+            --master_port=${MASTER_PORT} \
+            /workspace/GCNNPCR_python/train_distributed.py \
+                --dataset_root /data \
+                --checkpoint_dir /checkpoints \
+                --vis_dir /visuals \
+                --batch_size $BATCH_SIZE \
+                --num_epochs $NUM_EPOCHS \
+                --learning_rate $LEARNING_RATE \
+                --num_workers $NUM_WORKERS \
+                --train_areas "Area_1,Area_2,Area_3,Area_4,Area_5" \
+                --test_areas "Area_6" \
+                --mask_ratio 0.5 \
+                --num_points 8192 \
+                --patches_per_room 4 \
+                --vis_interval 10 \
+                --seed 42 \
+                $ATTENTION_ARG \
+                $RESUME_ARGS
     
 else
     # Multi-node training
