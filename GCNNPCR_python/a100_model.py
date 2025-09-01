@@ -362,7 +362,7 @@ class MultiGPUPointCompletionModel(nn.Module):
         # Feature processing
         self.feat_processor = nn.Sequential(
             nn.Linear(transformer_dim, transformer_dim),
-            nn.GroupNorm(32, transformer_dim),
+            nn.LayerNorm(transformer_dim),
             nn.ReLU(inplace=True),
             nn.Linear(transformer_dim, transformer_dim)
         )
