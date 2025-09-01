@@ -458,26 +458,28 @@ class MultiGPULoss(nn.Module):
                 disc_real: Optional[torch.Tensor] = None) -> dict:
         losses = {}
         
+        # Fix: Transpose pred from [B, 3, N] to [B, N, 3] for chamfer_distance
+        # gt already comes in as [B, N, 3]
+        pred_points = pred.transpose(1, 2) if pred.shape[1] == 3 else pred
+        
         # Chamfer distance
         from minimal_main_4 import chamfer_distance
-        losses['chamfer'] = chamfer_distance(pred, gt) * self.chamfer_weight
+        losses['chamfer'] = chamfer_distance(pred_points, gt) * self.chamfer_weight
         
         # EMD loss (if available and enabled)
-        # pred and gt come in as [B, 3, N]
-        pred_points = pred.transpose(1, 2)  # [B, N, 3]
-        gt_points   = gt.transpose(1, 2)    # [B, N, 3]
+        # No need to transpose again since we already have pred_points
         if self.emd_weight > 0 and self.emd_loss is not None:
-            losses['emd'] = self.emd_loss(pred_points, gt_points) * self.emd_weight
+            losses['emd'] = self.emd_loss(pred_points, gt) * self.emd_weight
         
-        # Repulsion loss
-        losses['repulsion'] = self.compute_repulsion(pred) * self.repulsion_weight
+        # Repulsion loss - also needs the transposed version
+        losses['repulsion'] = self.compute_repulsion(pred_points) * self.repulsion_weight
         
-        # Coverage loss
-        losses['coverage'] = self.compute_coverage(pred, partial) * self.coverage_weight
+        # Coverage loss - partial is already [B, N, 3]
+        losses['coverage'] = self.compute_coverage(pred_points, partial) * self.coverage_weight
         
         # Smoothness loss
-        losses['smoothness'] = self.compute_smoothness(pred) * self.smoothness_weight
-        
+        losses['smoothness'] = self.compute_smoothness(pred_points) * self.smoothness_weight
+                
         # GAN loss (if discriminator scores provided)
         if disc_fake is not None and disc_real is not None:
             losses['gan_g'] = F.binary_cross_entropy_with_logits(
