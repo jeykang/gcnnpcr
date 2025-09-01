@@ -108,6 +108,11 @@ class Trainer:
             smoothness_weight=args.smoothness_weight,
             use_emd=args.use_emd
         )
+
+        # Training state (must be before data loader setup)
+        self.epoch = 0
+        self.best_val_loss = float('inf')
+        self.current_points = args.start_points if args.progressive else args.num_points
         
         # Optimizer with different learning rates for different parts
         self.setup_optimizer()
@@ -118,10 +123,7 @@ class Trainer:
         # Learning rate scheduler (needs train_loader for OneCycle)
         self.setup_scheduler()
         
-        # Training state (must be before data loader setup)
-        self.epoch = 0
-        self.best_val_loss = float('inf')
-        self.current_points = args.start_points if args.progressive else args.num_points
+        
     
     @property
     def is_main_process(self):
