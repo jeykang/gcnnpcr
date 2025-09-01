@@ -63,6 +63,10 @@ print(f'CUDA: {torch.cuda.is_available()}')
     # Install PyTorch Geometric
     pip install --no-cache-dir torch-geometric==2.2.0
     
+    # Install pytorch3d (for better loss functions)
+    pip install --no-cache-dir \
+        "git+https://github.com/facebookresearch/pytorch3d.git@v0.7.2"
+    
     # Install other required packages
     pip install --no-cache-dir \
         scipy \
@@ -74,7 +78,9 @@ print(f'CUDA: {torch.cuda.is_available()}')
         open3d==0.17.0 \
         einops \
         lmdb \
-        pyyaml
+        pyyaml \
+        wandb \
+        h5py
     
     # Final verification
     python -c "
@@ -89,12 +95,20 @@ print(f'PyTorch: {torch.__version__}')
 print(f'PyTorch Geometric: {torch_geometric.__version__}')
 print(f'CUDA available: {torch.cuda.is_available()}')
 
+# Test mixed precision
+from torch.cuda.amp import autocast, GradScaler
+print('Mixed precision support: OK')
+
+# Test DDP
+import torch.distributed as dist
+print('Distributed training support: OK')
+
 assert np.__version__.startswith('1.'), f'NumPy version error: {np.__version__}'
 print('✓ All imports successful!')
 "
     
     # Create mount directories
-    mkdir -p /workspace /data /checkpoints /visuals
+    mkdir -p /workspace /data /checkpoints /visuals /experiments
 
 %environment
     export PYTHONPATH=/workspace:$PYTHONPATH
@@ -102,20 +116,28 @@ print('✓ All imports successful!')
     export PATH=$CUDA_HOME/bin:$PATH
     export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
     export OMP_NUM_THREADS=4
+    # Enable TF32 for A100
+    export TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1
+    # Better NCCL settings
+    export NCCL_DEBUG=WARN
+    export NCCL_SOCKET_IFNAME=^docker0,lo
 
 %runscript
-    echo "GCNN PCR Container (Alternative Build)"
-    echo "======================================="
+    echo "GCNN PCR Container - A100 Optimized"
+    echo "===================================="
     python -c "
 import torch, numpy, torch_geometric
 print(f'NumPy: {numpy.__version__}')
 print(f'PyTorch: {torch.__version__}')
 print(f'PyTorch Geometric: {torch_geometric.__version__}')
 print(f'CUDA: {torch.cuda.is_available()}')
+if torch.cuda.is_available():
+    print(f'GPU: {torch.cuda.get_device_name(0)}')
+    print(f'GPU Count: {torch.cuda.device_count()}')
 "
     exec "$@"
 
 %labels
     Author GCNNPCR Team
-    Version 2.0
-    Description Alternative build starting from CUDA base image with NumPy 1.x
+    Version 3.0
+    Description A100-optimized build with mixed precision and distributed training support
