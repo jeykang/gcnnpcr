@@ -52,10 +52,10 @@ class MultiScaleEncoder(nn.Module):
         fusion_dim = sum([hidden_dims[1], hidden_dims[2], out_dim])
         self.fusion = nn.Sequential(
             nn.Linear(fusion_dim, out_dim),
-            nn.GroupNorm(32, out_dim),  # GroupNorm with 32 groups
+            nn.LayerNorm(out_dim),
             nn.ReLU(inplace=True),
             nn.Linear(out_dim, out_dim),
-            nn.GroupNorm(32, out_dim),
+            nn.LayerNorm(out_dim),
             nn.ReLU(inplace=True)
         )
         
@@ -166,7 +166,7 @@ class AdaptiveDecoder(nn.Module):
         self.coord_heads = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(feat_dim, feat_dim),
-                nn.GroupNorm(32, feat_dim),
+                nn.LayerNorm(feat_dim),
                 nn.ReLU(inplace=True),
                 nn.Linear(feat_dim, 3)
             ) for _ in range(num_stages)
@@ -238,17 +238,17 @@ class AdaptiveRefinementStage(nn.Module):
         # Feature refinement with GroupNorm
         self.refine = nn.Sequential(
             nn.Linear(feat_dim * 2, feat_dim),
-            nn.GroupNorm(32, feat_dim),
+            nn.LayerNorm(feat_dim),
             nn.ReLU(inplace=True),
             nn.Linear(feat_dim, feat_dim),
-            nn.GroupNorm(32, feat_dim),
+            nn.LayerNorm(feat_dim),
             nn.ReLU(inplace=True)
         )
         
         # Adaptive splitting network
         self.split = nn.Sequential(
             nn.Linear(feat_dim * 2, feat_dim),
-            nn.GroupNorm(32, feat_dim),
+            nn.LayerNorm(feat_dim),
             nn.ReLU(inplace=True),
             nn.Linear(feat_dim, 6)  # 3 for offset, 3 for second point offset
         )
