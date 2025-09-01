@@ -463,8 +463,11 @@ class MultiGPULoss(nn.Module):
         losses['chamfer'] = chamfer_distance(pred, gt) * self.chamfer_weight
         
         # EMD loss (if available and enabled)
+        # pred and gt come in as [B, 3, N]
+        pred_points = pred.transpose(1, 2)  # [B, N, 3]
+        gt_points   = gt.transpose(1, 2)    # [B, N, 3]
         if self.emd_weight > 0 and self.emd_loss is not None:
-            losses['emd'] = self.emd_loss(pred, gt) * self.emd_weight
+            losses['emd'] = self.emd_loss(pred_points, gt_points) * self.emd_weight
         
         # Repulsion loss
         losses['repulsion'] = self.compute_repulsion(pred) * self.repulsion_weight
