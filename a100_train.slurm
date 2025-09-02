@@ -1,20 +1,21 @@
 #!/bin/bash
-#SBATCH --job-name=gcnn_a100_optimized
-#SBATCH --output=logs/optimized_%A.out
-#SBATCH --error=logs/optimized_%A.err
+#SBATCH --job-name=gcnn_anticollapse
+#SBATCH --output=logs/anticollapse_%A.out
+#SBATCH --error=logs/anticollapse_%A.err
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=8
 #SBATCH --gres=gpu:8
-#SBATCH --time=24:00:00
+#SBATCH --time=48:00:00
 #SBATCH --nodelist=hpc-pr-a-pod09
-#SBATCH --exclusive  # Get exclusive access to the node
+#SBATCH --exclusive
 
 # ============================================================================
-#  Optimized Training for 8x NVIDIA A100 GPUs
+#  Anti-Collapse Training for Point Cloud Completion on 8x A100 GPUs
+#  Using redesigned architecture based on PCN/FoldingNet/SnowflakeNet
 # ============================================================================
 
 echo "=============================================="
-echo "Optimized Multi-GPU Training on A100s"
+echo "Anti-Collapse Point Cloud Completion Training"
 echo "=============================================="
 echo "Job ID: ${SLURM_JOB_ID}"
 echo "Node: ${SLURM_NODELIST}"
@@ -26,37 +27,59 @@ echo "=============================================="
 PROJECT_ROOT=${PROJECT_ROOT:-$(pwd)}
 SINGULARITY_IMAGE="${SINGULARITY_IMAGE:-gcnnpcr.sif}"
 DATASET_ROOT="${PROJECT_ROOT}/data/S3DIS"
-EXPERIMENT_NAME="a100_optimized_$(date +%Y%m%d_%H%M%S)"
+EXPERIMENT_NAME="anticollapse_$(date +%Y%m%d_%H%M%S)"
 SAVE_DIR="${PROJECT_ROOT}/experiments/${EXPERIMENT_NAME}"
 
-# Training hyperparameters optimized for A100s
-BATCH_SIZE=16           # Per GPU - A100 can handle much larger batches
-GRAD_ACCUMULATION=2     # Effective batch = 16 * 8 * 2 = 256
-NUM_EPOCHS=300          # More epochs for better convergence
-LEARNING_RATE=2e-4      # Slightly higher LR for larger batch
-NUM_WORKERS=8           # More workers for faster data loading
+# Anti-collapse specific parameters
+BATCH_SIZE=8               # Smaller batch for stability (8 per GPU * 8 GPUs = 64 total)
+GRAD_ACCUMULATION=4         # Effective batch = 8 * 8 * 4 = 256
+NUM_EPOCHS=300
+INITIAL_LR=1e-4            # More conservative learning rate
+MASK_RATIO_START=0.2       # Start with easier masking
+MASK_RATIO_END=0.5         # Progress to harder masking
+NUM_WORKERS=6              # Slightly reduced for stability
+MIN_STD_THRESHOLD=0.15     # Collapse detection threshold
+PATIENCE=10                # Patience for collapse recovery
+
+# Model configuration
+ENCODER_TYPE="pcn"         # PCN encoder (more stable than graph)
+DECODER_TYPE="folding"     # Start with folding (switch to snowflake after stabilization)
+WARMUP_EPOCHS=20          # Warmup period with easier settings
 
 # Create directories
-mkdir -p "$SAVE_DIR"/{checkpoints,visuals,logs}
+mkdir -p "$SAVE_DIR"/{checkpoints,visuals,logs,metrics}
 mkdir -p "$PROJECT_ROOT/logs"
 
-# Copy configuration for reproducibility
-cat > "$SAVE_DIR/config.txt" << EOF
-Experiment: $EXPERIMENT_NAME
-Node: $SLURM_NODELIST
-GPUs: 8x NVIDIA A100
-Batch size per GPU: $BATCH_SIZE
-Gradient accumulation: $GRAD_ACCUMULATION
-Effective batch size: $((BATCH_SIZE * 8 * GRAD_ACCUMULATION))
-Learning rate: $LEARNING_RATE
-Epochs: $NUM_EPOCHS
-Date: $(date)
+# Save configuration
+cat > "$SAVE_DIR/config.json" << EOF
+{
+    "experiment": "$EXPERIMENT_NAME",
+    "node": "$SLURM_NODELIST",
+    "gpus": 8,
+    "batch_size_per_gpu": $BATCH_SIZE,
+    "gradient_accumulation": $GRAD_ACCUMULATION,
+    "effective_batch_size": $((BATCH_SIZE * 8 * GRAD_ACCUMULATION)),
+    "learning_rate": $INITIAL_LR,
+    "epochs": $NUM_EPOCHS,
+    "encoder": "$ENCODER_TYPE",
+    "decoder": "$DECODER_TYPE",
+    "mask_ratio_start": $MASK_RATIO_START,
+    "mask_ratio_end": $MASK_RATIO_END,
+    "min_std_threshold": $MIN_STD_THRESHOLD,
+    "warmup_epochs": $WARMUP_EPOCHS,
+    "date": "$(date)"
+}
 EOF
 
 # Check prerequisites
 if [ ! -f "$SINGULARITY_IMAGE" ]; then
-    echo "Building Singularity container..."
+    echo "ERROR: Singularity container not found: $SINGULARITY_IMAGE"
+    echo "Building container..."
     singularity build --fakeroot "$SINGULARITY_IMAGE" "${PROJECT_ROOT}/gcnnpcr.def"
+    if [ $? -ne 0 ]; then
+        echo "Failed to build Singularity container"
+        exit 1
+    fi
 fi
 
 if [ ! -d "$DATASET_ROOT" ]; then
@@ -64,34 +87,572 @@ if [ ! -d "$DATASET_ROOT" ]; then
     exit 1
 fi
 
+# Copy model files to experiment directory for reproducibility
+echo "Copying model architecture files..."
+cp "${PROJECT_ROOT}/GCNNPCR_python/redesigned_model.py" "$SAVE_DIR/"
+cp "${PROJECT_ROOT}/GCNNPCR_python/anticollapse_train.py" "$SAVE_DIR/"
+
 # Set environment for optimal A100 performance
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export NCCL_DEBUG=INFO
 export NCCL_SOCKET_IFNAME=^docker0,lo
-export NCCL_IB_DISABLE=0  # Enable InfiniBand if available
-export TORCH_CUDA_ARCH_LIST="8.0"  # A100 architecture
+export NCCL_IB_DISABLE=0
+export TORCH_CUDA_ARCH_LIST="8.0"
 export CUDA_LAUNCH_BLOCKING=0
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
 
-# Enable TF32 for A100 (faster training with minimal accuracy loss)
+# Anti-collapse specific settings
+export TORCH_CUDNN_BENCHMARK=0  # Disable for deterministic behavior
+export CUBLAS_WORKSPACE_CONFIG=:4096:8  # For deterministic cuBLAS
+export PYTHONHASHSEED=42  # Fixed seed for reproducibility
+
+# Enable TF32 for A100
 export TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1
 
 # Set distributed training environment
 export MASTER_ADDR=$(hostname)
 export MASTER_PORT=${MASTER_PORT:-29500}
+export WORLD_SIZE=8
+export OMP_NUM_THREADS=4
 
-echo -e "\n--- Training Configuration ---"
+echo -e "\n--- Anti-Collapse Configuration ---"
+echo "Architecture: $ENCODER_TYPE encoder + $DECODER_TYPE decoder"
+echo "Batch size per GPU: $BATCH_SIZE"
+echo "Gradient accumulation: $GRAD_ACCUMULATION"
 echo "Effective batch size: $((BATCH_SIZE * 8 * GRAD_ACCUMULATION))"
-echo "Total iterations: $((NUM_EPOCHS * 100))"  # Approximate
-echo "Mixed precision: Enabled (FP16)"
-echo "TF32: Enabled for A100"
-echo "Progressive training: Enabled"
-echo "------------------------------\n"
+echo "Initial learning rate: $INITIAL_LR"
+echo "Mask ratio: $MASK_RATIO_START -> $MASK_RATIO_END (progressive)"
+echo "Collapse threshold: $MIN_STD_THRESHOLD"
+echo "Warmup epochs: $WARMUP_EPOCHS"
+echo "-------------------------------------\n"
 
-# Save the enhanced model files to experiment directory
-cp "${PROJECT_ROOT}/GCNNPCR_python/a100_model.py" "$SAVE_DIR/"
-cp "${PROJECT_ROOT}/GCNNPCR_python/a100_train.py" "$SAVE_DIR/"
+# Create the main training script that will be executed
+cat > "$SAVE_DIR/train_anticollapse_distributed.py" << 'PYTHON_SCRIPT'
+#!/usr/bin/env python
+"""
+Distributed training script for anti-collapse model
+Generated by SLURM script - do not edit directly
+"""
 
-# Launch training with optimized settings
+import os
+import sys
+import json
+import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+import numpy as np
+
+# Add project to path
+sys.path.insert(0, '/workspace/GCNNPCR_python')
+
+# Import the redesigned model and training components
+from redesigned_model import (
+    AntiCollapsePointCompletion,
+    ImprovedLoss,
+    create_anticollapsemodel
+)
+
+# Import dataset
+from minimal_main_4 import S3DISDataset
+
+# Import base trainer components
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from torch.cuda.amp import autocast, GradScaler
+import torch.optim as optim
+from tqdm import tqdm
+
+class AntiCollapseDistributedTrainer:
+    """Distributed trainer for anti-collapse model"""
+    
+    def __init__(self, args):
+        self.args = args
+        self.setup_distributed()
+        
+        # Create model
+        self.model = AntiCollapsePointCompletion(
+            encoder_type=args.encoder_type,
+            decoder_type=args.decoder_type
+        ).to(self.device)
+        
+        # Wrap with DDP
+        if self.world_size > 1:
+            self.model = DDP(self.model, device_ids=[self.local_rank],
+                           find_unused_parameters=False)
+        
+        # Loss and optimizer
+        self.criterion = ImprovedLoss()
+        self.setup_optimizer()
+        
+        # Mixed precision
+        self.scaler = GradScaler(enabled=args.use_amp)
+        
+        # Data loaders
+        self.setup_data_loaders()
+        
+        # Tracking
+        self.epoch = 0
+        self.best_val_loss = float('inf')
+        self.collapse_counter = 0
+        self.metrics = {
+            'train_loss': [],
+            'val_loss': [],
+            'collapse_events': [],
+            'point_spread': []
+        }
+    
+    def setup_distributed(self):
+        """Initialize distributed training"""
+        if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+            self.rank = int(os.environ['RANK'])
+            self.local_rank = int(os.environ.get('LOCAL_RANK', 0))
+            self.world_size = int(os.environ['WORLD_SIZE'])
+        else:
+            self.rank = 0
+            self.local_rank = 0
+            self.world_size = 1
+        
+        if self.world_size > 1:
+            dist.init_process_group(backend='nccl')
+            torch.cuda.set_device(self.local_rank)
+        
+        self.device = torch.device(f'cuda:{self.local_rank}')
+    
+    def setup_optimizer(self):
+        """Setup optimizer with anti-collapse configuration"""
+        model = self.model.module if hasattr(self.model, 'module') else self.model
+        
+        params = [
+            {'params': model.encoder.parameters(), 'lr': self.args.learning_rate},
+            {'params': model.decoder.parameters(), 'lr': self.args.learning_rate * 0.5},
+            {'params': model.output_norm.parameters(), 'lr': self.args.learning_rate * 0.1},
+        ]
+        
+        self.optimizer = optim.AdamW(params, 
+                                    lr=self.args.learning_rate,
+                                    weight_decay=1e-4,
+                                    betas=(0.9, 0.999))
+        
+        # Cosine annealing with warm restarts
+        self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            self.optimizer, T_0=20, T_mult=2, eta_min=1e-7
+        )
+    
+    def setup_data_loaders(self):
+        """Setup distributed data loaders"""
+        # Progressive mask ratio
+        current_mask = self.get_current_mask_ratio()
+        
+        train_dataset = S3DISDataset(
+            root=self.args.dataset_root,
+            mask_ratio=current_mask,
+            num_points=self.args.num_points,
+            split="train",
+            patches_per_room=self.args.patches_per_room,
+            train_areas=["Area_1", "Area_2", "Area_3", "Area_4", "Area_5"],
+            test_areas=["Area_6"]
+        )
+        
+        val_dataset = S3DISDataset(
+            root=self.args.dataset_root,
+            mask_ratio=current_mask,
+            num_points=self.args.num_points,
+            split="val",
+            patches_per_room=2,
+            train_areas=["Area_1", "Area_2", "Area_3", "Area_4", "Area_5"],
+            test_areas=["Area_6"]
+        )
+        
+        # Distributed samplers
+        train_sampler = DistributedSampler(train_dataset, 
+                                          num_replicas=self.world_size,
+                                          rank=self.rank,
+                                          shuffle=True) if self.world_size > 1 else None
+        
+        val_sampler = DistributedSampler(val_dataset,
+                                        num_replicas=self.world_size,
+                                        rank=self.rank,
+                                        shuffle=False) if self.world_size > 1 else None
+        
+        self.train_loader = DataLoader(
+            train_dataset,
+            batch_size=self.args.batch_size,
+            shuffle=(train_sampler is None),
+            sampler=train_sampler,
+            num_workers=self.args.num_workers,
+            pin_memory=True,
+            persistent_workers=True,
+            drop_last=True
+        )
+        
+        self.val_loader = DataLoader(
+            val_dataset,
+            batch_size=self.args.batch_size,
+            shuffle=False,
+            sampler=val_sampler,
+            num_workers=self.args.num_workers,
+            pin_memory=True,
+            persistent_workers=True
+        )
+    
+    def get_current_mask_ratio(self):
+        """Get progressive mask ratio based on epoch"""
+        if self.epoch < self.args.warmup_epochs:
+            return self.args.mask_ratio_start
+        
+        progress = (self.epoch - self.args.warmup_epochs) / (self.args.num_epochs - self.args.warmup_epochs)
+        progress = min(1.0, progress)
+        
+        # Smooth progression
+        progress = np.sin(progress * np.pi / 2)
+        
+        return self.args.mask_ratio_start + (self.args.mask_ratio_end - self.args.mask_ratio_start) * progress
+    
+    def check_collapse(self, output):
+        """Check for point cloud collapse"""
+        if output.shape[1] == 3:
+            output = output.transpose(1, 2)
+        
+        std = output.std(dim=1).mean().item()
+        
+        # Sample for pairwise distance check
+        sample_size = min(100, output.shape[1])
+        sample_idx = torch.randperm(output.shape[1], device=output.device)[:sample_size]
+        sample = output[:, sample_idx]
+        
+        dist = torch.cdist(sample, sample)
+        dist = dist + torch.eye(sample_size, device=dist.device) * 1e10
+        min_dist = dist.min(dim=-1)[0].mean().item()
+        
+        is_collapsed = std < self.args.min_std_threshold or min_dist < 0.01
+        
+        return {
+            'is_collapsed': is_collapsed,
+            'std': std,
+            'min_dist': min_dist
+        }
+    
+    def train_epoch(self):
+        """Train for one epoch"""
+        self.model.train()
+        total_losses = {key: 0.0 for key in ['total', 'chamfer', 'spread', 'coverage']}
+        collapse_events = 0
+        num_batches = 0
+        
+        if self.rank == 0:
+            pbar = tqdm(self.train_loader, desc=f"Epoch {self.epoch}")
+        else:
+            pbar = self.train_loader
+        
+        accumulation_steps = self.args.gradient_accumulation
+        self.optimizer.zero_grad()
+        
+        for batch_idx, batch in enumerate(pbar):
+            partial = batch['partial'].to(self.device, non_blocking=True)
+            full = batch['full'].to(self.device, non_blocking=True)
+            
+            with autocast(enabled=self.args.use_amp):
+                output = self.model(partial)
+                
+                # Check for collapse
+                collapse_info = self.check_collapse(output)
+                if collapse_info['is_collapsed']:
+                    collapse_events += 1
+                    self.collapse_counter += 1
+                    
+                    if self.rank == 0 and self.collapse_counter > self.args.patience:
+                        print(f"\n⚠️ Persistent collapse detected! Counter: {self.collapse_counter}")
+                        self.handle_collapse()
+                else:
+                    self.collapse_counter = 0
+                
+                # Compute loss
+                gt_coords = full[..., :3]
+                partial_coords = partial[..., :3]
+                losses = self.criterion(output, gt_coords, partial_coords)
+                loss = losses['total'] / accumulation_steps
+            
+            # Backward pass
+            self.scaler.scale(loss).backward()
+            
+            # Update weights
+            if (batch_idx + 1) % accumulation_steps == 0:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.optimizer.zero_grad()
+            
+            # Accumulate losses
+            for key in total_losses:
+                if key in losses:
+                    total_losses[key] += losses[key].item()
+            num_batches += 1
+            
+            # Update progress bar
+            if self.rank == 0 and isinstance(pbar, tqdm):
+                pbar.set_postfix({
+                    'loss': losses['total'].item(),
+                    'std': collapse_info['std'],
+                    'collapsed': collapse_events
+                })
+        
+        # Average losses
+        avg_losses = {key: val / num_batches for key, val in total_losses.items()}
+        
+        # Reduce across GPUs
+        if self.world_size > 1:
+            for key in avg_losses:
+                loss_tensor = torch.tensor(avg_losses[key]).to(self.device)
+                dist.all_reduce(loss_tensor)
+                avg_losses[key] = loss_tensor.item() / self.world_size
+        
+        return avg_losses, collapse_events
+    
+    def handle_collapse(self):
+        """Handle persistent collapse"""
+        if self.rank != 0:
+            return
+        
+        print("Taking recovery actions:")
+        
+        # 1. Reduce learning rate
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] *= 0.5
+        print(f"  - Reduced learning rate to {self.optimizer.param_groups[0]['lr']:.2e}")
+        
+        # 2. Reinitialize decoder if using folding
+        model = self.model.module if hasattr(self.model, 'module') else self.model
+        if hasattr(model.decoder, 'folding_nets'):
+            for net in model.decoder.folding_nets:
+                for layer in net:
+                    if isinstance(layer, nn.Linear):
+                        nn.init.xavier_normal_(layer.weight)
+            print("  - Reinitialized folding networks")
+        
+        # 3. Add noise to break symmetry
+        if hasattr(model.decoder, 'split_scale'):
+            with torch.no_grad():
+                model.decoder.split_scale.data += torch.randn_like(
+                    model.decoder.split_scale.data
+                ) * 0.01
+            print("  - Added noise to split scales")
+        
+        self.collapse_counter = 0
+    
+    def validate(self):
+        """Validation loop"""
+        self.model.eval()
+        total_losses = {key: 0.0 for key in ['total', 'chamfer']}
+        total_std = 0.0
+        num_batches = 0
+        
+        with torch.no_grad():
+            for batch in self.val_loader:
+                partial = batch['partial'].to(self.device, non_blocking=True)
+                full = batch['full'].to(self.device, non_blocking=True)
+                
+                with autocast(enabled=self.args.use_amp):
+                    output = self.model(partial)
+                    
+                    collapse_info = self.check_collapse(output)
+                    total_std += collapse_info['std']
+                    
+                    gt_coords = full[..., :3]
+                    partial_coords = partial[..., :3]
+                    losses = self.criterion(output, gt_coords, partial_coords)
+                
+                for key in total_losses:
+                    if key in losses:
+                        total_losses[key] += losses[key].item()
+                num_batches += 1
+        
+        avg_losses = {key: val / num_batches for key, val in total_losses.items()}
+        avg_std = total_std / num_batches
+        
+        # Reduce across GPUs
+        if self.world_size > 1:
+            for key in avg_losses:
+                loss_tensor = torch.tensor(avg_losses[key]).to(self.device)
+                dist.all_reduce(loss_tensor)
+                avg_losses[key] = loss_tensor.item() / self.world_size
+            
+            std_tensor = torch.tensor(avg_std).to(self.device)
+            dist.all_reduce(std_tensor)
+            avg_std = std_tensor.item() / self.world_size
+        
+        return avg_losses, avg_std
+    
+    def save_checkpoint(self, is_best=False):
+        """Save checkpoint"""
+        if self.rank != 0:
+            return
+        
+        model_state = self.model.module.state_dict() if hasattr(self.model, 'module') \
+                     else self.model.state_dict()
+        
+        checkpoint = {
+            'epoch': self.epoch,
+            'model_state_dict': model_state,
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'best_val_loss': self.best_val_loss,
+            'metrics': self.metrics,
+            'args': self.args
+        }
+        
+        path = f"/experiment/checkpoints/epoch_{self.epoch}.pth"
+        torch.save(checkpoint, path)
+        
+        if is_best:
+            torch.save(checkpoint, "/experiment/checkpoints/best_model.pth")
+            print(f"Saved best model: val_loss={self.best_val_loss:.4f}")
+        
+        # Save metrics
+        with open("/experiment/metrics/metrics.json", 'w') as f:
+            json.dump(self.metrics, f, indent=2)
+    
+    def train(self):
+        """Main training loop"""
+        for epoch in range(self.args.num_epochs):
+            self.epoch = epoch + 1
+            
+            # Update mask ratio
+            if epoch % 10 == 0:
+                self.setup_data_loaders()
+            
+            # Set epoch for distributed sampler
+            if hasattr(self.train_loader.sampler, 'set_epoch'):
+                self.train_loader.sampler.set_epoch(epoch)
+            
+            # Switch decoder after warmup if stable
+            if epoch == self.args.warmup_epochs:
+                self.maybe_switch_decoder()
+            
+            # Train
+            train_losses, collapse_events = self.train_epoch()
+            
+            # Validate
+            val_losses, avg_std = self.validate()
+            
+            # Update scheduler
+            self.scheduler.step()
+            
+            # Record metrics
+            self.metrics['train_loss'].append(train_losses['total'])
+            self.metrics['val_loss'].append(val_losses['total'])
+            self.metrics['collapse_events'].append(collapse_events)
+            self.metrics['point_spread'].append(avg_std)
+            
+            # Logging
+            if self.rank == 0:
+                print(f"\nEpoch {self.epoch}/{self.args.num_epochs}")
+                print(f"  Train Loss: {train_losses['total']:.4f}, Collapses: {collapse_events}")
+                print(f"  Val Loss: {val_losses['total']:.4f}, Spread: {avg_std:.4f}")
+                print(f"  LR: {self.optimizer.param_groups[0]['lr']:.2e}")
+                print(f"  Mask Ratio: {self.get_current_mask_ratio():.2f}")
+                
+                # Save checkpoint
+                is_best = val_losses['total'] < self.best_val_loss
+                if is_best:
+                    self.best_val_loss = val_losses['total']
+                self.save_checkpoint(is_best)
+            
+            # Synchronize
+            if self.world_size > 1:
+                dist.barrier()
+    
+    def maybe_switch_decoder(self):
+        """Switch from folding to snowflake decoder if stable"""
+        if self.rank != 0:
+            return
+        
+        avg_spread = np.mean(self.metrics['point_spread'][-10:]) if len(self.metrics['point_spread']) > 10 else 0
+        
+        if avg_spread > 0.3 and self.args.decoder_type == "folding":
+            print("\n🔄 Switching to Snowflake decoder for finer details...")
+            # Note: In practice, you'd need to transfer weights or reinitialize
+            # This is a placeholder for the concept
+            print("  (Would require model architecture change - keep folding for now)")
+
+
+def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset_root', type=str, default='/data')
+    parser.add_argument('--num_points', type=int, default=8192)
+    parser.add_argument('--batch_size', type=int, default=8)
+    parser.add_argument('--num_epochs', type=int, default=300)
+    parser.add_argument('--learning_rate', type=float, default=1e-4)
+    parser.add_argument('--gradient_accumulation', type=int, default=4)
+    parser.add_argument('--num_workers', type=int, default=6)
+    parser.add_argument('--patches_per_room', type=int, default=4)
+    
+    # Anti-collapse specific
+    parser.add_argument('--encoder_type', type=str, default='pcn')
+    parser.add_argument('--decoder_type', type=str, default='folding')
+    parser.add_argument('--mask_ratio_start', type=float, default=0.2)
+    parser.add_argument('--mask_ratio_end', type=float, default=0.5)
+    parser.add_argument('--min_std_threshold', type=float, default=0.15)
+    parser.add_argument('--warmup_epochs', type=int, default=20)
+    parser.add_argument('--patience', type=int, default=10)
+    parser.add_argument('--use_amp', action='store_true', default=True)
+    
+    args = parser.parse_args()
+    
+    # Create trainer
+    trainer = AntiCollapseDistributedTrainer(args)
+    
+    # Train
+    if trainer.rank == 0:
+        print("\n" + "="*60)
+        print("Starting Anti-Collapse Training")
+        print(f"Architecture: {args.encoder_type} + {args.decoder_type}")
+        print(f"World Size: {trainer.world_size}")
+        print("="*60 + "\n")
+    
+    trainer.train()
+    
+    # Cleanup
+    if trainer.world_size > 1:
+        dist.destroy_process_group()
+
+
+if __name__ == '__main__':
+    main()
+PYTHON_SCRIPT
+
+# Launch distributed training with torchrun
+echo "Launching anti-collapse training..."
+
+# Monitor function for collapse detection
+monitor_collapse() {
+    local log_file="$SAVE_DIR/logs/training.log"
+    local collapse_count=0
+    
+    while true; do
+        sleep 60  # Check every minute
+        
+        if [ -f "$log_file" ]; then
+            # Count collapse events in last 100 lines
+            collapse_count=$(tail -100 "$log_file" | grep -c "collapsed" || true)
+            
+            if [ $collapse_count -gt 10 ]; then
+                echo "⚠️ High collapse rate detected: $collapse_count events"
+                
+                # Send alert (optional - depends on your setup)
+                # echo "Model collapse detected on ${SLURM_JOB_ID}" | mail -s "Training Alert" your@email.com
+            fi
+        fi
+    done
+}
+
+# Start background monitor (optional)
+# monitor_collapse &
+# MONITOR_PID=$!
+
+# Main training command
 singularity exec --nv \
     --bind "${PROJECT_ROOT}:/workspace" \
     --bind "${DATASET_ROOT}:/data" \
@@ -103,43 +664,62 @@ singularity exec --nv \
         --nproc_per_node=8 \
         --master_addr=${MASTER_ADDR} \
         --master_port=${MASTER_PORT} \
-        /workspace/GCNNPCR_python/a100_train.py \
+        /experiment/train_anticollapse_distributed.py \
             --dataset_root /data \
-            --checkpoint_dir /experiment/checkpoints \
-            --vis_dir /experiment/visuals \
-            --batch_size $BATCH_SIZE \
-            --gradient_accumulation $GRAD_ACCUMULATION \
-            --num_epochs $NUM_EPOCHS \
-            --learning_rate $LEARNING_RATE \
-            --weight_decay 1e-4 \
-            --num_workers $NUM_WORKERS \
-            --mask_ratio 0.35 \
             --num_points 8192 \
-            --patches_per_room 8 \
-            --progressive \
-            --start_points 1024 \
-            --scheduler onecycle \
+            --batch_size $BATCH_SIZE \
+            --num_epochs $NUM_EPOCHS \
+            --learning_rate $INITIAL_LR \
+            --gradient_accumulation $GRAD_ACCUMULATION \
+            --num_workers $NUM_WORKERS \
+            --patches_per_room 4 \
+            --encoder_type $ENCODER_TYPE \
+            --decoder_type $DECODER_TYPE \
+            --mask_ratio_start $MASK_RATIO_START \
+            --mask_ratio_end $MASK_RATIO_END \
+            --min_std_threshold $MIN_STD_THRESHOLD \
+            --warmup_epochs $WARMUP_EPOCHS \
+            --patience $PATIENCE \
             --use_amp \
-            --use_emd \
-            --chamfer_weight 1.0 \
-            --emd_weight 0.3 \
-            --repulsion_weight 0.15 \
-            --coverage_weight 0.25 \
-            --smoothness_weight 0.08 \
-            --vis_interval 5 \
-            --grad_clip 1.0 \
             2>&1 | tee "$SAVE_DIR/logs/training.log"
 
 EXIT_CODE=$?
 
+# Kill monitor if running
+# [ ! -z "$MONITOR_PID" ] && kill $MONITOR_PID 2>/dev/null
+
 echo -e "\n=============================================="
 if [ $EXIT_CODE -eq 0 ]; then
-    echo "Training completed successfully!"
+    echo "✅ Anti-collapse training completed successfully!"
     echo "Results saved to: $SAVE_DIR"
     
-    # Run final evaluation (optional)
+    # Check final model quality
+    if [ -f "$SAVE_DIR/metrics/metrics.json" ]; then
+        echo -e "\n--- Final Metrics ---"
+        python3 -c "
+import json
+with open('$SAVE_DIR/metrics/metrics.json') as f:
+    metrics = json.load(f)
+    if metrics.get('point_spread'):
+        final_spread = metrics['point_spread'][-1]
+        print(f'Final point spread: {final_spread:.4f}')
+        if final_spread < 0.15:
+            print('⚠️ WARNING: Model may still be collapsed!')
+        elif final_spread < 0.3:
+            print('⚠️ CAUTION: Model has low spread')
+        else:
+            print('✅ Model has healthy point spread!')
+    
+    if metrics.get('collapse_events'):
+        total_collapses = sum(metrics['collapse_events'])
+        print(f'Total collapse events: {total_collapses}')
+"
+    fi
+    
+    # Optional: Run evaluation on best model
     if [ -f "$SAVE_DIR/checkpoints/best_model.pth" ]; then
-        echo -e "\nRunning final evaluation..."
+        echo -e "\nRunning evaluation on best model..."
+        
         singularity exec --nv \
             --bind "${PROJECT_ROOT}:/workspace" \
             --bind "${DATASET_ROOT}:/data" \
@@ -149,19 +729,54 @@ if [ $EXIT_CODE -eq 0 ]; then
                 --checkpoint /experiment/checkpoints/best_model.pth \
                 --dataset_root /data \
                 --output_dir /experiment/evaluation \
-                --num_vis_samples 10 \
-                --max_batches 50
-    else
-        echo "No best model found for evaluation"
+                --max_batches 50 \
+                --num_vis_samples 10
     fi
 else
-    echo "Training failed with exit code $EXIT_CODE"
+    echo "❌ Training failed with exit code $EXIT_CODE"
     echo "Check logs at: $SAVE_DIR/logs/training.log"
+    
+    # Analyze failure
+    if [ -f "$SAVE_DIR/logs/training.log" ]; then
+        echo -e "\n--- Error Analysis ---"
+        echo "Last 20 lines of log:"
+        tail -20 "$SAVE_DIR/logs/training.log"
+        
+        # Check for common issues
+        if grep -q "CUDA out of memory" "$SAVE_DIR/logs/training.log"; then
+            echo -e "\n⚠️ OOM detected - try reducing batch size or model size"
+        fi
+        
+        if grep -q "persistent collapse" "$SAVE_DIR/logs/training.log"; then
+            echo -e "\n⚠️ Persistent collapse detected - model architecture may need revision"
+        fi
+    fi
 fi
 echo "=============================================="
 
-# Copy logs to experiment directory
-cp "${PROJECT_ROOT}/logs/optimized_${SLURM_JOB_ID}.out" "$SAVE_DIR/logs/"
-cp "${PROJECT_ROOT}/logs/optimized_${SLURM_JOB_ID}.err" "$SAVE_DIR/logs/"
+# Copy SLURM logs to experiment directory
+cp "${PROJECT_ROOT}/logs/anticollapse_${SLURM_JOB_ID}.out" "$SAVE_DIR/logs/slurm.out"
+cp "${PROJECT_ROOT}/logs/anticollapse_${SLURM_JOB_ID}.err" "$SAVE_DIR/logs/slurm.err"
+
+# Generate summary report
+cat > "$SAVE_DIR/summary.txt" << EOF
+Anti-Collapse Training Summary
+==============================
+Job ID: ${SLURM_JOB_ID}
+Node: ${SLURM_NODELIST}
+Start Time: $(date -r "$SAVE_DIR/config.json")
+End Time: $(date)
+Exit Code: $EXIT_CODE
+Experiment: $EXPERIMENT_NAME
+
+Configuration:
+- Architecture: $ENCODER_TYPE + $DECODER_TYPE
+- Batch Size: $BATCH_SIZE per GPU (effective: $((BATCH_SIZE * 8 * GRAD_ACCUMULATION)))
+- Learning Rate: $INITIAL_LR
+- Epochs: $NUM_EPOCHS
+- Mask Ratio: $MASK_RATIO_START -> $MASK_RATIO_END
+
+Results Location: $SAVE_DIR
+EOF
 
 exit $EXIT_CODE
