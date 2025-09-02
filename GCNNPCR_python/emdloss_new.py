@@ -106,24 +106,35 @@ class SinkhornEMDLoss(torch.nn.Module):
     def forward(self, pred, gt):
         """
         pred: [B, N, 3]
-        gt:   [B, N, 3]
+        gt:   [B, M, 3]  # Note: M might differ from N
         Returns:
-          emd_loss: scalar
+        emd_loss: scalar
         """
-        B, N, C = pred.shape
+        B_pred, N_pred, C = pred.shape
+        B_gt, N_gt, _ = gt.shape
         
-        # 1) Downsample if needed
-        pred_ds = downsample_points(pred, self.num_samples)  # [B, K, 3] (K = num_samples)
-        gt_ds   = downsample_points(gt, self.num_samples)    # [B, K, 3]
+        assert B_pred == B_gt, f"Batch sizes must match: pred {B_pred} vs gt {B_gt}"
+        B = B_pred
+        
+        # Ensure both point clouds have the same number of points for EMD
+        # If they differ, we need to sample to a common size
+        target_samples = min(self.num_samples, min(N_pred, N_gt))
+        
+        # 1) Sample both to the same target size
+        pred_ds = self._sample_points(pred, target_samples)  # [B, target_samples, 3]
+        gt_ds = self._sample_points(gt, target_samples)      # [B, target_samples, 3]
+        
+        # Verify they're the same size
+        assert pred_ds.shape[1] == gt_ds.shape[1], f"Sampled sizes don't match: {pred_ds.shape} vs {gt_ds.shape}"
 
         # 2) Compute cost matrix
-        cost = pairwise_distance_sq(pred_ds, gt_ds)  # [B, K, K], squared Euclidean
+        cost = pairwise_distance_sq(pred_ds, gt_ds)  # [B, target_samples, target_samples], squared Euclidean
 
         # 3) logK = - cost / reg
         logK = -cost / self.reg
 
         # 4) Stabilized Sinkhorn
-        if self.use_warm_start and self.last_logP is not None:
+        if self.use_warm_start and self.last_logP is not None and self.last_logP.shape == logK.shape:
             logP = sinkhorn_log_stabilized(
                 logK,
                 max_iters=self.max_iters,
@@ -136,10 +147,10 @@ class SinkhornEMDLoss(torch.nn.Module):
             )
 
         # 5) Convert logP back to P
-        P = logP.exp()  # [B, K, K], doubly-stochastic approx.
+        P = logP.exp()  # [B, target_samples, target_samples], doubly-stochastic approx.
 
         # 6) EMD ~ sum_{i,j} cost[i,j]*P[i,j], scaled by 1/K if you want average per point
-        emd_batch = (P * cost).sum(dim=(1,2)) / float(self.num_samples)
+        emd_batch = (P * cost).sum(dim=(1,2)) / float(target_samples)
         emd_mean = emd_batch.mean()
 
         # 7) Update warm start memory
@@ -147,4 +158,36 @@ class SinkhornEMDLoss(torch.nn.Module):
             self.last_logP = logP.detach()
 
         return emd_mean
+
+    def _sample_points(self, points, num_samples):
+        """
+        Sample exactly num_samples points from the input point cloud.
+        If input has fewer points, sample with replacement.
+        
+        points: [B, N, 3]
+        num_samples: target number of points
+        Returns: [B, num_samples, 3]
+        """
+        B, N, C = points.shape
+        
+        if N == num_samples:
+            return points
+        elif N > num_samples:
+            # Downsample without replacement
+            idx = torch.stack([
+                torch.randperm(N, device=points.device)[:num_samples] 
+                for _ in range(B)
+            ])
+        else:
+            # Upsample with replacement
+            idx = torch.stack([
+                torch.randint(0, N, (num_samples,), device=points.device) 
+                for _ in range(B)
+            ])
+        
+        # Gather points
+        batch_indices = torch.arange(B, device=points.device).unsqueeze(-1).expand(-1, num_samples)
+        sampled = points[batch_indices, idx, :]
+        
+        return sampled
 
