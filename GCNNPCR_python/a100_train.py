@@ -258,6 +258,9 @@ class Trainer:
             with autocast(enabled=self.args.use_amp):
                 output = self.model(partial)  # [B, 3, N]
                 #output = output.permute(0, 2, 1)  # [B, N, 3]
+
+                if torch.isnan(output).any() or torch.isinf(output).any():
+                    print("Warning: model output contains NaN or Inf values.")
                 
                 gt_coords = full[..., :3]
                 partial_coords = partial[..., :3]
@@ -321,6 +324,9 @@ class Trainer:
                 with autocast(enabled=self.args.use_amp):
                     output = self.model(partial)
                     #output = output.permute(0, 2, 1)
+
+                    if torch.isnan(output).any() or torch.isinf(output).any():
+                        print("Warning: model output contains NaN or Inf values.")
                     
                     gt_coords = full[..., :3]
                     partial_coords = partial[..., :3]
@@ -450,6 +456,9 @@ class Trainer:
             
             with autocast(enabled=self.args.use_amp):
                 output = self.model(partial)
+
+            if torch.isnan(output).any() or torch.isinf(output).any():
+                    print("Warning: model output contains NaN or Inf values.")
             
             output = output.permute(0, 2, 1)[0].cpu()
             partial_viz = partial[0, ..., :3].cpu()

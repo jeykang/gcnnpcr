@@ -408,9 +408,12 @@ class MultiGPUPointCompletionModel(nn.Module):
         global_std = feat_processed.std(dim=1)  # Add std for more info
         global_feat = (global_max + global_mean + global_std) / 3
         
-        # Decode to complete point cloud
+        # Decode to complete point cloud and bound coordinates to a safe range.
         completed_xyz = self.decoder(partial_xyz, feat_processed, global_feat)
-        
+        # Without an activation on the output, coordinates can explode and cause the
+        # Chamfer/EMD distances to overflow.  Tanh keeps them in [-1, 1].
+        completed_xyz = torch.tanh(completed_xyz)
+
         # Transpose for output format
         completed = completed_xyz.transpose(1, 2)  # [B, 3, 8192]
         
@@ -467,9 +470,11 @@ class MultiGPULoss(nn.Module):
         losses['chamfer'] = chamfer_distance(pred_points, gt) * self.chamfer_weight
         
         # EMD loss (if available and enabled)
-        # No need to transpose again since we already have pred_points
+        # Compute this in full precision to avoid under/overflow in the Sinkhorn solver.
         if self.emd_weight > 0 and self.emd_loss is not None:
-            losses['emd'] = self.emd_loss(pred_points, gt) * self.emd_weight
+            with torch.cuda.amp.autocast(enabled=False):
+                emd_val = self.emd_loss(pred_points, gt)
+            losses['emd'] = emd_val * self.emd_weight
         
         # Repulsion loss - also needs the transposed version
         losses['repulsion'] = self.compute_repulsion(pred_points) * self.repulsion_weight
