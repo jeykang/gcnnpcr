@@ -44,7 +44,7 @@ class CollapseMonitor:
         self.history = []
     
     def check_collapse(self, output_points: torch.Tensor) -> Dict[str, Any]:
-        """Check if points have collapsed"""
+        """Check if points have collapsed - simplified version"""
         B, N, _ = output_points.shape
         
         # Compute per-batch statistics
@@ -55,14 +55,18 @@ class CollapseMonitor:
         # Check pairwise distances for more robust detection
         sample_size = min(1000, N)
         sample_idx = torch.randperm(N, device=output_points.device)[:sample_size]
-        sample_points = output_points[:, sample_idx]
+        sample_points = output_points[:, sample_idx]  # [B, sample_size, 3]
         
-        pairwise_dist = torch.cdist(sample_points, sample_points)
-        # Remove diagonal
-        mask = ~torch.eye(sample_size, dtype=torch.bool, device=pairwise_dist.device)
-        pairwise_dist = pairwise_dist[mask].reshape(B, sample_size, sample_size - 1)
+        # Compute pairwise distances
+        pairwise_dist = torch.cdist(sample_points, sample_points)  # [B, sample_size, sample_size]
         
-        mean_nn_dist = pairwise_dist.min(dim=-1)[0].mean().item()
+        # Add large value to diagonal to exclude self-distances
+        diagonal_mask = torch.eye(sample_size, device=pairwise_dist.device).unsqueeze(0)  # [1, sample_size, sample_size]
+        pairwise_dist = pairwise_dist + diagonal_mask * 1e10
+        
+        # Get minimum distance for each point (nearest neighbor)
+        nn_distances = pairwise_dist.min(dim=-1)[0]  # [B, sample_size]
+        mean_nn_dist = nn_distances.mean().item()
         
         # Determine collapse state
         is_collapsed = mean_std < self.min_std_threshold or mean_nn_dist < 0.01
