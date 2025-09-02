@@ -89,7 +89,7 @@ fi
 
 # Copy model files to experiment directory for reproducibility
 echo "Copying model architecture files..."
-cp "${PROJECT_ROOT}/GCNNPCR_python/redesigned_model.py" "$SAVE_DIR/"
+cp "${PROJECT_ROOT}/GCNNPCR_python/a100_model.py" "$SAVE_DIR/"
 cp "${PROJECT_ROOT}/GCNNPCR_python/anticollapse_train.py" "$SAVE_DIR/"
 
 # Set environment for optimal A100 performance
@@ -146,7 +146,7 @@ import numpy as np
 sys.path.insert(0, '/workspace/GCNNPCR_python')
 
 # Import the redesigned model and training components
-from redesigned_model import (
+from a100_model import (
     AntiCollapsePointCompletion,
     ImprovedLoss,
     create_anticollapsemodel
