@@ -27,7 +27,11 @@ def load_model(checkpoint_path, device='cuda'):
     else:
         # Try to infer from state dict keys
         state_dict = checkpoint.get('model_state_dict', checkpoint)
-        if 'encoder.encoders.0.weight' in state_dict or \
+        # Recognise multi‑GPU models by looking for gconvs/fusion/feat_processor keys.
+        if any(k.startswith('encoder.encoders.0.gconvs') for k in state_dict) or \
+           any(k.startswith('encoder.fusion') for k in state_dict) or \
+           any(k.startswith('feat_processor') for k in state_dict) or \
+           'encoder.encoders.0.weight' in state_dict or \
            'encoder.encoders.0.conv_cls.weight' in state_dict:
             model_type = 'multigpu'
         else:

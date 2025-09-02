@@ -412,7 +412,13 @@ class MultiGPUPointCompletionModel(nn.Module):
         completed_xyz = self.decoder(partial_xyz, feat_processed, global_feat)
         # Without an activation on the output, coordinates can explode and cause the
         # Chamfer/EMD distances to overflow.  Tanh keeps them in [-1, 1].
+        # Bound outputs to [-1, 1] and replace any NaN/Inf values with finite
+        # numbers.  Even with tanh some upstream layer may produce NaNs; this call
+        # prevents them from propagating further.
         completed_xyz = torch.tanh(completed_xyz)
+        completed_xyz = torch.nan_to_num(
+            completed_xyz, nan=0.0, posinf=1.0, neginf=-1.0
+        )
 
         # Transpose for output format
         completed = completed_xyz.transpose(1, 2)  # [B, 3, 8192]
