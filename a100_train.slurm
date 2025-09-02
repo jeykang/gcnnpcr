@@ -167,6 +167,18 @@ class AntiCollapseDistributedTrainer:
     
     def __init__(self, args):
         self.args = args
+
+        # Tracking
+        self.epoch = 0
+        self.best_val_loss = float('inf')
+        self.collapse_counter = 0
+        self.metrics = {
+            'train_loss': [],
+            'val_loss': [],
+            'collapse_events': [],
+            'point_spread': []
+        }
+
         self.setup_distributed()
         
         # Create model
@@ -190,16 +202,7 @@ class AntiCollapseDistributedTrainer:
         # Data loaders
         self.setup_data_loaders()
         
-        # Tracking
-        self.epoch = 0
-        self.best_val_loss = float('inf')
-        self.collapse_counter = 0
-        self.metrics = {
-            'train_loss': [],
-            'val_loss': [],
-            'collapse_events': [],
-            'point_spread': []
-        }
+        
     
     def setup_distributed(self):
         """Initialize distributed training"""
