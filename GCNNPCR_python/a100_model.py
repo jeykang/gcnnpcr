@@ -61,25 +61,26 @@ class GridGenerator(nn.Module):
 
 
 class PCNEncoder(nn.Module):
-    """Encoder inspired by Point Completion Network"""
+    """Encoder inspired by Point Completion Network with InstanceNorm."""
     def __init__(self, in_dim: int = 6, out_dim: int = 1024):
         super().__init__()
-        
+
         # PointNet-style encoder with skip connections
         self.conv1 = nn.Conv1d(in_dim, 128, 1)
         self.conv2 = nn.Conv1d(128, 256, 1)
         self.conv3 = nn.Conv1d(256, 512, 1)
         self.conv4 = nn.Conv1d(512, out_dim, 1)
-        
-        self.bn1 = nn.BatchNorm1d(128)
-        self.bn2 = nn.BatchNorm1d(256)
-        self.bn3 = nn.BatchNorm1d(512)
-        self.bn4 = nn.BatchNorm1d(out_dim)
-        
+
+        # Use InstanceNorm rather than BatchNorm (affine=True lets the layer learn scale/bias)
+        self.bn1 = nn.InstanceNorm1d(128, affine=True)
+        self.bn2 = nn.InstanceNorm1d(256, affine=True)
+        self.bn3 = nn.InstanceNorm1d(512, affine=True)
+        self.bn4 = nn.InstanceNorm1d(out_dim, affine=True)
+
         # Feature aggregation
         self.final_conv = nn.Conv1d(128 + 256 + 512 + out_dim, out_dim, 1)
-        self.final_bn = nn.BatchNorm1d(out_dim)
-    
+        self.final_bn = nn.InstanceNorm1d(out_dim, affine=True)
+
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
         Args:
@@ -90,33 +91,34 @@ class PCNEncoder(nn.Module):
         """
         # Transpose for Conv1d
         x = x.transpose(1, 2)  # [B, 6, N]
-        
-        # Extract hierarchical features
+
+        # Extract hierarchical features with instance norm and ReLU
         feat1 = F.relu(self.bn1(self.conv1(x)))  # [B, 128, N]
         feat2 = F.relu(self.bn2(self.conv2(feat1)))  # [B, 256, N]
         feat3 = F.relu(self.bn3(self.conv3(feat2)))  # [B, 512, N]
-        feat4 = F.relu(self.bn4(self.conv4(feat3)))  # [B, 1024, N]
-        
+        feat4 = F.relu(self.bn4(self.conv4(feat3)))  # [B, out_dim, N]
+
         # Concatenate multi-scale features
         concat_feat = torch.cat([feat1, feat2, feat3, feat4], dim=1)
         combined = F.relu(self.final_bn(self.final_conv(concat_feat)))
-        
+
         # Global feature via max pooling
         global_feat = combined.max(dim=2)[0]  # [B, out_dim]
-        
+
         # Store point-wise features for skip connections
         point_feats = [
             feat1.transpose(1, 2),  # [B, N, 128]
             feat2.transpose(1, 2),  # [B, N, 256]
             feat3.transpose(1, 2),  # [B, N, 512]
-            feat4.transpose(1, 2),  # [B, N, 1024]
+            feat4.transpose(1, 2),  # [B, N, out_dim]
         ]
-        
+
         return global_feat, point_feats
 
 
+
 class FoldingDecoder(nn.Module):
-    """Folding-based decoder with dropout regularisation"""
+    """Folding-based decoder with dropout and InstanceNorm."""
     def __init__(self, feat_dim: int = 1024, num_patches: int = 4, points_per_patch: int = 256):
         super().__init__()
         self.feat_dim = feat_dim
@@ -127,18 +129,18 @@ class FoldingDecoder(nn.Module):
         # Generate base 2D grid
         self.register_buffer('base_grid', GridGenerator.square_grid(self.grid_size))
 
-        # Multiple folding networks with dropout
+        # Multiple folding networks
         self.folding_nets = nn.ModuleList()
         for _ in range(num_patches):
             folding = nn.Sequential(
                 nn.Linear(feat_dim + 2, 512),
                 nn.ReLU(),
-                nn.BatchNorm1d(512),
-                nn.Dropout(0.1),          # new dropout
+                nn.InstanceNorm1d(512, affine=True),  # InstanceNorm instead of BatchNorm
+                nn.Dropout(0.1),
                 nn.Linear(512, 256),
                 nn.ReLU(),
-                nn.BatchNorm1d(256),
-                nn.Dropout(0.1),          # new dropout
+                nn.InstanceNorm1d(256, affine=True),  # InstanceNorm instead of BatchNorm
+                nn.Dropout(0.1),
                 nn.Linear(256, 3),
             )
             self.folding_nets.append(folding)
@@ -147,12 +149,12 @@ class FoldingDecoder(nn.Module):
         self.refine_net = nn.Sequential(
             nn.Linear(feat_dim + 3, 512),
             nn.ReLU(),
-            nn.BatchNorm1d(512),
-            nn.Dropout(0.1),              # new dropout
+            nn.InstanceNorm1d(512, affine=True),
+            nn.Dropout(0.1),
             nn.Linear(512, 256),
             nn.ReLU(),
-            nn.BatchNorm1d(256),
-            nn.Dropout(0.1),              # new dropout
+            nn.InstanceNorm1d(256, affine=True),
+            nn.Dropout(0.1),
             nn.Linear(256, 3)
         )
 
@@ -170,7 +172,8 @@ class FoldingDecoder(nn.Module):
             # Expand features for all grid points
             feat_expanded = global_feat.unsqueeze(1).expand(B, self.points_per_patch, -1)
             grid_expanded = self.base_grid.unsqueeze(0).expand(B, -1, -1)
-            # Reshape for BatchNorm
+
+            # Reshape for InstanceNorm
             feat_expanded_flat = feat_expanded.reshape(B * self.points_per_patch, -1)
             grid_expanded_flat = grid_expanded.reshape(B * self.points_per_patch, -1)
 
@@ -189,6 +192,7 @@ class FoldingDecoder(nn.Module):
             all_points.append(final_points)
 
         return torch.cat(all_points, dim=1)
+
 
 
 
