@@ -10,6 +10,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import numpy as np
 from tqdm import tqdm
+import math
 
 # Import the redesigned model
 from a100_model import (
@@ -110,29 +111,29 @@ class AntiCollapseTrainer:
         )
     
     def check_collapse(self, output):
-        """Check if output has collapsed"""
         if output.shape[1] == 3:
             output = output.transpose(1, 2)
-        
-        # Compute statistics
+
         std = output.std(dim=1).mean().item()
-        
-        # Compute pairwise distances
+
+        # sample-based minimum distance
         sample_size = min(100, output.shape[1])
         sample_idx = torch.randperm(output.shape[1], device=output.device)[:sample_size]
         sample = output[:, sample_idx]
-        
         dist = torch.cdist(sample, sample)
         dist = dist + torch.eye(sample_size, device=dist.device) * 1e10
         min_dist = dist.min(dim=-1)[0].mean().item()
-        
-        is_collapsed = std < 0.1 or min_dist < 0.01
-        
-        return {
-            'is_collapsed': is_collapsed,
-            'std': std,
-            'min_dist': min_dist
-        }
+
+        # treat NaN or too‑small statistics as collapsed
+        if math.isnan(std) or math.isnan(min_dist):
+            is_collapsed = True
+        else:
+            is_collapsed = std < self.args.min_std_threshold or min_dist < 0.01
+
+        return {'is_collapsed': is_collapsed,
+                'std': std,
+                'min_dist': min_dist}
+
     
     def train_epoch(self, epoch):
         """Train for one epoch with collapse prevention"""
