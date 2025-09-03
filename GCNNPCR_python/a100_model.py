@@ -251,22 +251,25 @@ class SnowflakeDecoder(nn.Module):
 
 
 class SkipAttention(nn.Module):
-    """Cross-attention from generated points to partial input"""
+    """Cross-attention from generated points to partial input with dropout."""
     def __init__(self, feat_dim: int, num_points: int):
         super().__init__()
         self.num_points = num_points
-        
+
         # Query, Key, Value projections
         self.q_proj = nn.Linear(feat_dim, feat_dim)
         self.k_proj = nn.Linear(feat_dim, feat_dim)
         self.v_proj = nn.Linear(feat_dim, feat_dim)
-        
-        # Output projection
-        self.out_proj = nn.Linear(feat_dim, feat_dim)
-        
-        # Layer norm
+
+        # Output projection with dropout for stability
+        self.out_proj = nn.Sequential(
+            nn.Linear(feat_dim, feat_dim),
+            nn.Dropout(0.1)          # new dropout layer
+        )
+
+        # LayerNorm instead of BatchNorm for better small-batch behaviour
         self.norm = nn.LayerNorm(feat_dim)
-    
+
     def forward(self, query_xyz: torch.Tensor, query_feat: torch.Tensor,
                 key_xyz: torch.Tensor, key_feat: torch.Tensor) -> torch.Tensor:
         """
@@ -279,29 +282,31 @@ class SkipAttention(nn.Module):
             updated_feat: [B, N, feat_dim]
         """
         B, N, _ = query_xyz.shape
-        M = key_xyz.shape[1]
-        
-        # Compute attention based on both features and positions
+
+        # Project to query/key/value
         Q = self.q_proj(query_feat)  # [B, N, feat_dim]
-        K = self.k_proj(key_feat)     # [B, M, feat_dim]
-        V = self.v_proj(key_feat)     # [B, M, feat_dim]
-        
-        # Attention scores with positional bias
+        K = self.k_proj(key_feat)    # [B, M, feat_dim]
+        V = self.v_proj(key_feat)    # [B, M, feat_dim]
+
+        # Compute attention scores with positional bias
         scores = torch.bmm(Q, K.transpose(1, 2)) / math.sqrt(Q.shape[-1])
-        
-        # Add distance-based attention bias
+        # Gaussian distance weighting
         dist = torch.cdist(query_xyz, key_xyz)  # [B, N, M]
-        dist_weight = torch.exp(-dist * 2.0)  # Gaussian weighting
+        dist_weight = torch.exp(-dist * 2.0)
         scores = scores + torch.log(dist_weight + 1e-8)
-        
-        # Apply attention
+
+        # Softmax and dropout on attention map
         attn = F.softmax(scores, dim=-1)
+        attn = F.dropout(attn, p=0.1, training=self.training)
+
+        # Aggregate values
         attended = torch.bmm(attn, V)
-        
-        # Residual connection and layer norm
+
+        # Residual connection with layer normalisation and dropout on the output projection
         output = self.norm(query_feat + self.out_proj(attended))
-        
+
         return output
+
 
 
 class ChildPointGenerator(nn.Module):
