@@ -61,7 +61,7 @@ class GridGenerator(nn.Module):
 
 
 class PCNEncoder(nn.Module):
-    """Encoder inspired by Point Completion Network with InstanceNorm."""
+    """Encoder inspired by Point Completion Network with LayerNorm."""
     def __init__(self, in_dim: int = 6, out_dim: int = 1024):
         super().__init__()
 
@@ -71,15 +71,15 @@ class PCNEncoder(nn.Module):
         self.conv3 = nn.Conv1d(256, 512, 1)
         self.conv4 = nn.Conv1d(512, out_dim, 1)
 
-        # Use InstanceNorm rather than BatchNorm (affine=True lets the layer learn scale/bias)
-        self.bn1 = nn.InstanceNorm1d(128, affine=True)
-        self.bn2 = nn.InstanceNorm1d(256, affine=True)
-        self.bn3 = nn.InstanceNorm1d(512, affine=True)
-        self.bn4 = nn.InstanceNorm1d(out_dim, affine=True)
+        # Use LayerNorm for better stability with variable batch sizes
+        self.ln1 = nn.LayerNorm(128)
+        self.ln2 = nn.LayerNorm(256)
+        self.ln3 = nn.LayerNorm(512)
+        self.ln4 = nn.LayerNorm(out_dim)
 
         # Feature aggregation
         self.final_conv = nn.Conv1d(128 + 256 + 512 + out_dim, out_dim, 1)
-        self.final_bn = nn.InstanceNorm1d(out_dim, affine=True)
+        self.final_ln = nn.LayerNorm(out_dim)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
@@ -89,18 +89,28 @@ class PCNEncoder(nn.Module):
             global_feat: [B, out_dim] global feature
             point_feats: List of intermediate features for skip connections
         """
+        B, N, C = x.shape
+        
         # Transpose for Conv1d
         x = x.transpose(1, 2)  # [B, 6, N]
 
-        # Extract hierarchical features with instance norm and ReLU
-        feat1 = F.relu(self.bn1(self.conv1(x)))  # [B, 128, N]
-        feat2 = F.relu(self.bn2(self.conv2(feat1)))  # [B, 256, N]
-        feat3 = F.relu(self.bn3(self.conv3(feat2)))  # [B, 512, N]
-        feat4 = F.relu(self.bn4(self.conv4(feat3)))  # [B, out_dim, N]
+        # Extract hierarchical features with LayerNorm and ReLU
+        feat1 = self.conv1(x).transpose(1, 2)  # [B, N, 128]
+        feat1 = F.relu(self.ln1(feat1)).transpose(1, 2)  # [B, 128, N]
+        
+        feat2 = self.conv2(feat1).transpose(1, 2)  # [B, N, 256]
+        feat2 = F.relu(self.ln2(feat2)).transpose(1, 2)  # [B, 256, N]
+        
+        feat3 = self.conv3(feat2).transpose(1, 2)  # [B, N, 512]
+        feat3 = F.relu(self.ln3(feat3)).transpose(1, 2)  # [B, 512, N]
+        
+        feat4 = self.conv4(feat3).transpose(1, 2)  # [B, N, out_dim]
+        feat4 = F.relu(self.ln4(feat4)).transpose(1, 2)  # [B, out_dim, N]
 
         # Concatenate multi-scale features
         concat_feat = torch.cat([feat1, feat2, feat3, feat4], dim=1)
-        combined = F.relu(self.final_bn(self.final_conv(concat_feat)))
+        combined = self.final_conv(concat_feat).transpose(1, 2)  # [B, N, out_dim]
+        combined = F.relu(self.final_ln(combined)).transpose(1, 2)  # [B, out_dim, N]
 
         # Global feature via max pooling
         global_feat = combined.max(dim=2)[0]  # [B, out_dim]
@@ -116,9 +126,8 @@ class PCNEncoder(nn.Module):
         return global_feat, point_feats
 
 
-
 class FoldingDecoder(nn.Module):
-    """Folding-based decoder with dropout and InstanceNorm."""
+    """Folding-based decoder with dropout and LayerNorm."""
     def __init__(self, feat_dim: int = 1024, num_patches: int = 4, points_per_patch: int = 256):
         super().__init__()
         self.feat_dim = feat_dim
@@ -135,11 +144,11 @@ class FoldingDecoder(nn.Module):
             folding = nn.Sequential(
                 nn.Linear(feat_dim + 2, 512),
                 nn.ReLU(),
-                nn.InstanceNorm1d(512, affine=True),  # InstanceNorm instead of BatchNorm
+                nn.LayerNorm(512),  # LayerNorm instead of InstanceNorm
                 nn.Dropout(0.1),
                 nn.Linear(512, 256),
                 nn.ReLU(),
-                nn.InstanceNorm1d(256, affine=True),  # InstanceNorm instead of BatchNorm
+                nn.LayerNorm(256),  # LayerNorm instead of InstanceNorm
                 nn.Dropout(0.1),
                 nn.Linear(256, 3),
             )
@@ -149,11 +158,11 @@ class FoldingDecoder(nn.Module):
         self.refine_net = nn.Sequential(
             nn.Linear(feat_dim + 3, 512),
             nn.ReLU(),
-            nn.InstanceNorm1d(512, affine=True),
+            nn.LayerNorm(512),  # LayerNorm instead of InstanceNorm
             nn.Dropout(0.1),
             nn.Linear(512, 256),
             nn.ReLU(),
-            nn.InstanceNorm1d(256, affine=True),
+            nn.LayerNorm(256),  # LayerNorm instead of InstanceNorm
             nn.Dropout(0.1),
             nn.Linear(256, 3)
         )
@@ -171,9 +180,9 @@ class FoldingDecoder(nn.Module):
         for folding_net in self.folding_nets:
             # Expand features for all grid points
             feat_expanded = global_feat.unsqueeze(1).expand(B, self.points_per_patch, -1)
-            grid_expanded = self.base_grid.unsqueeze(0).expand(B, -1, -1)
+            grid_expanded = self.base_grid.unsqueeze(0).expand(B, -1, -1).to(global_feat.device)
 
-            # Reshape for InstanceNorm
+            # Reshape for processing
             feat_expanded_flat = feat_expanded.reshape(B * self.points_per_patch, -1)
             grid_expanded_flat = grid_expanded.reshape(B * self.points_per_patch, -1)
 
@@ -192,8 +201,6 @@ class FoldingDecoder(nn.Module):
             all_points.append(final_points)
 
         return torch.cat(all_points, dim=1)
-
-
 
 
 class SnowflakeDecoder(nn.Module):
@@ -268,7 +275,7 @@ class SkipAttention(nn.Module):
         # Output projection with dropout for stability
         self.out_proj = nn.Sequential(
             nn.Linear(feat_dim, feat_dim),
-            nn.Dropout(0.1)          # new dropout layer
+            nn.Dropout(0.1)          # dropout layer
         )
 
         # LayerNorm instead of BatchNorm for better small-batch behaviour
@@ -312,7 +319,6 @@ class SkipAttention(nn.Module):
         return output
 
 
-
 class ChildPointGenerator(nn.Module):
     """Generate child points from parent points with controlled split scale"""
     def __init__(self, feat_dim: int):
@@ -324,10 +330,10 @@ class ChildPointGenerator(nn.Module):
             nn.ReLU(),
             nn.Linear(512, 256),
             nn.ReLU(),
-            nn.Dropout(0.1),          # new dropout for stability
+            nn.Dropout(0.1),          # dropout for stability
             nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Dropout(0.1),          # new dropout for stability
+            nn.Dropout(0.1),          # dropout for stability
             nn.Linear(128, 6)         # 2 children x 3 coordinates
         )
 
@@ -335,7 +341,7 @@ class ChildPointGenerator(nn.Module):
         self.feat_refine = nn.Sequential(
             nn.Linear(feat_dim * 2, feat_dim),
             nn.ReLU(),
-            nn.Dropout(0.1),          # new dropout for stability
+            nn.Dropout(0.1),          # dropout for stability
             nn.Linear(feat_dim, feat_dim)
         )
 
@@ -378,7 +384,6 @@ class ChildPointGenerator(nn.Module):
         child_feat = torch.cat([child_feat, child_feat], dim=1)
 
         return child_xyz, child_feat
-
 
 
 class AntiCollapsePointCompletion(nn.Module):
@@ -443,13 +448,7 @@ class AntiCollapsePointCompletion(nn.Module):
             completed_xyz = self.decoder(global_feat)
         
         # Normalize output to prevent unbounded growth
-        # Apply per-coordinate normalization
-        #completed_xyz_flat = completed_xyz.reshape(B * completed_xyz.shape[1], 3)
-        #completed_xyz_norm = self.output_norm(completed_xyz_flat)
-        #completed_xyz = completed_xyz_norm.reshape(B, -1, 3)
-
-        # Normalise each point’s coordinates using LayerNorm
-        # completed_xyz has shape [B, P, 3]; LayerNorm normalises across the last dim
+        # Normalise each point's coordinates using LayerNorm
         completed_xyz = self.output_norm(completed_xyz)
         
         # Apply tanh for final bounding
