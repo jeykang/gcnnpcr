@@ -116,44 +116,46 @@ class PCNEncoder(nn.Module):
 
 
 class FoldingDecoder(nn.Module):
-    """Folding-based decoder that deforms 2D grids"""
+    """Folding-based decoder with dropout regularisation"""
     def __init__(self, feat_dim: int = 1024, num_patches: int = 4, points_per_patch: int = 256):
         super().__init__()
         self.feat_dim = feat_dim
         self.num_patches = num_patches
         self.points_per_patch = points_per_patch
         self.grid_size = int(np.sqrt(points_per_patch))
-        
+
         # Generate base 2D grid
         self.register_buffer('base_grid', GridGenerator.square_grid(self.grid_size))
-        
-        # Multiple folding networks (like AtlasNet)
+
+        # Multiple folding networks with dropout
         self.folding_nets = nn.ModuleList()
         for _ in range(num_patches):
             folding = nn.Sequential(
-                # First folding
                 nn.Linear(feat_dim + 2, 512),
                 nn.ReLU(),
                 nn.BatchNorm1d(512),
+                nn.Dropout(0.1),          # new dropout
                 nn.Linear(512, 256),
                 nn.ReLU(),
                 nn.BatchNorm1d(256),
+                nn.Dropout(0.1),          # new dropout
                 nn.Linear(256, 3),
-                
             )
             self.folding_nets.append(folding)
-        
+
         # Second-stage folding for refinement
         self.refine_net = nn.Sequential(
             nn.Linear(feat_dim + 3, 512),
             nn.ReLU(),
             nn.BatchNorm1d(512),
+            nn.Dropout(0.1),              # new dropout
             nn.Linear(512, 256),
             nn.ReLU(),
             nn.BatchNorm1d(256),
+            nn.Dropout(0.1),              # new dropout
             nn.Linear(256, 3)
         )
-    
+
     def forward(self, global_feat: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -163,31 +165,31 @@ class FoldingDecoder(nn.Module):
         """
         B = global_feat.shape[0]
         all_points = []
-        
-        for i, folding_net in enumerate(self.folding_nets):
+
+        for folding_net in self.folding_nets:
             # Expand features for all grid points
             feat_expanded = global_feat.unsqueeze(1).expand(B, self.points_per_patch, -1)
             grid_expanded = self.base_grid.unsqueeze(0).expand(B, -1, -1)
-            
             # Reshape for BatchNorm
             feat_expanded_flat = feat_expanded.reshape(B * self.points_per_patch, -1)
             grid_expanded_flat = grid_expanded.reshape(B * self.points_per_patch, -1)
-            
+
             # First folding
             folding_input = torch.cat([feat_expanded_flat, grid_expanded_flat], dim=-1)
             folded = folding_net(folding_input)
             folded = folded.reshape(B, self.points_per_patch, 3)
-            
+
             # Second folding for refinement
             refine_input = torch.cat([feat_expanded_flat, folded.reshape(B * self.points_per_patch, 3)], dim=-1)
             refined = self.refine_net(refine_input)
             refined = refined.reshape(B, self.points_per_patch, 3)
-            
+
             # Add residual
             final_points = folded + refined * 0.1
             all_points.append(final_points)
-        
+
         return torch.cat(all_points, dim=1)
+
 
 
 class SnowflakeDecoder(nn.Module):
@@ -303,31 +305,34 @@ class SkipAttention(nn.Module):
 
 
 class ChildPointGenerator(nn.Module):
-    """Generate child points from parent points"""
+    """Generate child points from parent points with controlled split scale"""
     def __init__(self, feat_dim: int):
         super().__init__()
-        
+
         # Network to generate splitting parameters
         self.split_net = nn.Sequential(
             nn.Linear(feat_dim * 2, 512),
             nn.ReLU(),
             nn.Linear(512, 256),
             nn.ReLU(),
+            nn.Dropout(0.1),          # new dropout for stability
             nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Linear(128, 6)  # 2 children x 3 coordinates
+            nn.Dropout(0.1),          # new dropout for stability
+            nn.Linear(128, 6)         # 2 children x 3 coordinates
         )
-        
+
         # Feature refinement for children
         self.feat_refine = nn.Sequential(
             nn.Linear(feat_dim * 2, feat_dim),
             nn.ReLU(),
+            nn.Dropout(0.1),          # new dropout for stability
             nn.Linear(feat_dim, feat_dim)
         )
-        
-        # Learnable splitting scale
+
+        # Learnable splitting scale (initialised small)
         self.split_scale = nn.Parameter(torch.tensor(0.05))
-    
+
     def forward(self, parent_xyz: torch.Tensor, parent_feat: torch.Tensor,
                 global_feat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -340,30 +345,31 @@ class ChildPointGenerator(nn.Module):
             child_feat: [B, N*2, feat_dim]
         """
         B, N, _ = parent_xyz.shape
-        
+
         # Combine with global features
         global_expanded = global_feat.unsqueeze(1).expand(B, N, -1)
         combined = torch.cat([parent_feat, global_expanded], dim=-1)
-        
+
         # Generate child offsets
         offsets = self.split_net(combined)  # [B, N, 6]
-        offset1 = offsets[..., :3] * self.split_scale.abs()
-        offset2 = offsets[..., 3:] * self.split_scale.abs()
-        
-        # Add random perturbation to break symmetry
-        noise = torch.randn_like(offset2) * 0.01
-        offset2 = offset2 + noise
-        
+
+        # Clamp the splitting scale to prevent runaway growth
+        scale = torch.clamp(self.split_scale.abs(), max=0.05)
+
+        offset1 = offsets[..., :3] * scale
+        offset2 = offsets[..., 3:] * scale
+
         # Generate child points
         child1_xyz = parent_xyz + offset1
         child2_xyz = parent_xyz + offset2
         child_xyz = torch.cat([child1_xyz, child2_xyz], dim=1)
-        
+
         # Refine features for children
         child_feat = self.feat_refine(combined)
         child_feat = torch.cat([child_feat, child_feat], dim=1)
-        
+
         return child_xyz, child_feat
+
 
 
 class AntiCollapsePointCompletion(nn.Module):
@@ -396,7 +402,7 @@ class AntiCollapsePointCompletion(nn.Module):
             self.decoder = FoldingDecoder(feat_dim=1024, num_patches=8, points_per_patch=1024)
         
         # Output regularization
-        self.output_norm = nn.BatchNorm1d(3)
+        self.output_norm = nn.LayerNorm(3)
     
     def forward(self, partial_6d: torch.Tensor) -> torch.Tensor:
         """
@@ -429,9 +435,13 @@ class AntiCollapsePointCompletion(nn.Module):
         
         # Normalize output to prevent unbounded growth
         # Apply per-coordinate normalization
-        completed_xyz_flat = completed_xyz.reshape(B * completed_xyz.shape[1], 3)
-        completed_xyz_norm = self.output_norm(completed_xyz_flat)
-        completed_xyz = completed_xyz_norm.reshape(B, -1, 3)
+        #completed_xyz_flat = completed_xyz.reshape(B * completed_xyz.shape[1], 3)
+        #completed_xyz_norm = self.output_norm(completed_xyz_flat)
+        #completed_xyz = completed_xyz_norm.reshape(B, -1, 3)
+
+        # Normalise each point’s coordinates using LayerNorm
+        # completed_xyz has shape [B, P, 3]; LayerNorm normalises across the last dim
+        completed_xyz = self.output_norm(completed_xyz)
         
         # Apply tanh for final bounding
         completed_xyz = torch.tanh(completed_xyz) * 1.5  # Scale to [-1.5, 1.5]
